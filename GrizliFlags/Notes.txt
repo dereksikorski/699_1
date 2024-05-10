@@ -1,0 +1,28 @@
+p1	--> Done 02/25
+p2	--> Done 02/18
+p3	--> Done 02/25
+p4	--> Done 02/25 (n=88 is weird)
+p5	--> Done 02/28
+p6	--> Done 03/02
+p7	--> Done 03/03 (n=42 diff spikes/n=98 weird)
+p8	--> Done 03/04
+p9	--> Done 02/16
+p10	--> Done 02/14
+p11	--> Done 03/24
+p12	--> Done 03/24	(n=43weird)
+p13	--> Done 03/24	(n=7 superweird, n=22supercool,n=81wow!)
+p14	--> Done 03/24 (n=80 weirdcont)
+p15	--> Done 03/24 (n=14merger,n=54pair?,n=81weird)
+p16	--> Done 03/28 (n=93 coolimg, 94 pair)
+p17	--> Done 03/28 (n=8 jet!, n=84interesting)
+p18	--> Done 03/29 (n=79 greatHypSpec, n=94 cool)
+p19	--> Done 03/30
+p20	--> Done 03/30 (n=0reallycool!,n=12 superbrightco, n=48GreatHyperionGalaxy!)
+p21	--> Done 03/22
+p22	--> Done 03/22	(n=78 great hyperion spec)
+p23	--> Done 03/18	(n=7  weird spikey thing in spec, n=25 waves)
+p24	--> Done 03/10 (n=34 amazing emission lines!)
+p25	--> Done 03/07
+p26	--> Done 02/19
+p27	--> Done 03/10
+p128	--> Done 03/30
