@@ -17,10 +17,11 @@ import matplotlib.gridspec as gridspec
 class GalPop:
 
 
-    def __init__(self, coords=[], ms=[], obs_type = [], n_sigmas=[], ODs=[], pks={},  mags={}, verbose=False) -> None:
+    def __init__(self, IDs=[], coords=[], ms=[], obs_type = [], n_sigmas=[], ODs=[], pks={},  mags={}, verbose=False) -> None:
         """
         Create a population of galaxies:
         ATTRIBUTES:
+            - IDs   (array)     = array of IDs for the galaxies
             - coords (array)    = 2D array of [ra, dec, z] for each galaxy
                 - shape = (# of galaxies, 3)
             - ms    (array)     = array of galaxy masses
@@ -38,6 +39,7 @@ class GalPop:
             - verbose (bool)    = If changed to True, each method call prints updates to track progress
         """
         ## Optional Variables
+        self.IDs    = IDs       # Galaxy IDs
         self.coords = coords        # Galaxy coords [ [ra1, dec1, z1], [ra2, dec2, z2], ...]
         self.ms = ms  # Mass
         self.obs_type = obs_type        # photz or specz
@@ -51,7 +53,8 @@ class GalPop:
         ## Interior Variables
         self.voxels = []    # Voxels of each galaxy
         self.subpops = {}   # Create samples based on sigma-cuts
-        self.vols = {}
+        self.vols = {}      # volumes of the sigma cuts
+        self.smfs = {}      # smf information stored as [[m1, N1, n1, n_error1], ...] for each value
 
 
     # ====================================================================
@@ -108,14 +111,12 @@ class GalPop:
                 
                 pk = -99    # Initially assign the galaxy to no peak
 
-
                 ## Loop through each peak until galaxy is placed in one
                 for p in pk_sum:    
 
                     # Test if gal is within min-max range of peak
                     if (p[-6]<=v[0] <= p[-5]) and (p[-4]<=v[1]<=p[-3]) and (p[-2]<=v[2]<=p[-1]):
                         
-
                         try:    # Use peak data from dictionary if it's already been loaded
                             p_data = pk_dict[p[0]]  
                         except: # Otherwise, load in the peak data
@@ -152,7 +153,7 @@ class GalPop:
             - sig_range  (array) = Define the range of overdensities to test [sig_min , sig_max). Note if sig_min != -99 or
                 sig_max != np.inf, they should correspond to a key in the self.pks dict set via self.assignPeaks
                 - If sig_max == np.inf, report all galaxies above sig_min. 
-                - If sig_min == -99, report all galaxies less than sig_max (useful for field)
+                - If sig_min == -99, report all galaxies outside of peaks with a voxel above sig_max
             - min_mass (float)  =  Mass-cutoff for peaks
             - z_range    (array) = Define the redshift range to look at [z_min, z_max]
             - pk_path (str)    - The path to the directory containing all of the find_peaks information 
@@ -166,7 +167,7 @@ class GalPop:
                 - directory = If you want to save, put the directory name to save to here
         """
         # Check if relevant peak information has been found
-        if sig_range[1] not in self.pks:
+        if (sig_range[1] not in self.pks) and (sig_range[1] != np.inf):
                 print(f"self.pks has no key {sig_range[1]}. Run self.assignPeaks with this key")
                 return
         
@@ -224,7 +225,7 @@ class GalPop:
             
         ## NO UPPER BOUND (half-open sigma-interval)
         else:   
-            mask = np.in1d(self.pks[sig_range[1]], g_pks[:,0])   # Make mask for if peak number is in relevant peak
+            mask = np.in1d(self.pks[sig_range[0]], g_pks[:,0])   # Make mask for if peak number is in relevant peak
             test_idxs = np.where((self.coords[:,2] >= z_range[0]) & (self.coords[:,2] <= z_range[1])    # In relevant redshift
                             & (self.n_sigmas >= sig_range[0])   # In relevant overdensity
                             & mask )    # In relevant 
@@ -236,8 +237,11 @@ class GalPop:
 
         ## Not the field
         if sig_range[0] != -99:
-            unique_peaks = np.unique(self.pks[sig_range[1]][test_idxs]) # Find peak numbers that have a galaxy in them
-            Vol = np.sum(pk_sum[np.where(unique_peaks == pk_sum[0])][:,10])     # sum the volumes of the peaks
+            rel_sig = int(not(sig_range[1] == np.inf))  # Check if upper bound or not, and find volume accordingly
+            unique_peaks = np.unique(self.pks[sig_range[rel_sig]][test_idxs]) # Find peak numbers that have a galaxy in them
+            Vol = np.sum(pk_sum[np.argmin(np.abs(unique_peaks[:,np.newaxis] - pk_sum[:,0]), axis=1)][:,10])     # sum the volumes of the peaks
+
+
 
         ## Field sample
         else:
@@ -249,7 +253,8 @@ class GalPop:
             theta_RA  = np.abs(np.max(self.coords[test_idxs][:,0])-np.min(self.coords[test_idxs][:,0]))*np.pi/180  * np.cos(theta_dec)
             Omega     = theta_RA * theta_dec # get rid of unit
             V_cube  = Omega/(4*np.pi) *(cosmo.comoving_volume(z_range[1]) - cosmo.comoving_volume(z_range[0]))
-            Vol = V_cube - bad_Vol
+            Vol = V_cube.value - bad_Vol
+
 
         self.vols[key_name] = Vol
 
@@ -271,8 +276,8 @@ class GalPop:
         Helper method for plotting data from the subPop
         """
 
-        ra_range = [np.min(self.coords[:,0]), np.max(self.coords[:,1])]
-        dec_range = [np.min(self.coords[:,0]), np.max(self.coords[:,1])]
+        ra_range = [np.min(self.coords[:,0]), np.max(self.coords[:,0])]
+        dec_range = [np.min(self.coords[:,1]), np.max(self.coords[:,1])]
 
 
         style_dict = {          # Dictionary of all the styles
@@ -361,7 +366,7 @@ class GalPop:
 
     # ====================================================================
 
-    def SMF(self, key_names, m_range, plot = "None"):
+    def SMF(self, key_names, m_range):
         """
         Generates SMFs based on the key-names associated with different subpops. 
 
@@ -369,42 +374,56 @@ class GalPop:
             - key_names (array) =  keys for self.subpops dictionary. These are the sub pops which will have an SMF generate for them
             - m_range (array) = mass-range to generate the SMF for
                 - [min_mass, max_mass, m_step]
-            - plot (str)    - Plotting option -- Plots via helper method
-                - "None" = No plots
-                - "show" = Show the plot in the terminal
-                - directory = If you want to save, put the directory name to save to here
-
         """
-        # Where to store the SMFs
-        masses = []
-        ns = []
-
         for k in key_names:
 
-            m_temp = []
-            n_temp = []
-            mass = m_range[0]
+            smf_info = []       # Store smf info for this key as [[m, N, n, n_err], ...]
+            mass = m_range[0]   # keep track of mass
 
             while mass <= m_range[1]:
+                smf_mbin = []   # [m, N, n, n_error] for this mass bin
 
+                # Find galaxies in the mass bin
                 gals = np.where( (self.ms[self.subpops[k]] >= mass) & (self.ms[self.subpops[k]] < mass + m_range[2]) )[0]
 
-                if len(gals) != 0:
-                    m_temp.append(np.median(self.ms[self.subpops[k]][gals]))
-                    n_temp.append(len(gals) / self.vols[k] / m_range[2])
-                else:
-                    m_temp.append(mass)
-                    n_temp.append(np.nan)
+                if len(gals) != 0:  # If there are galaxies in the mass bin
+                    smf_mbin.append(np.median(self.ms[self.subpops[k]][gals]))  # mass
+                    smf_mbin.append(len(gals))                  # N
+                    smf_mbin.append(len(gals) / self.vols[k] / m_range[2])  # n
+                    smf_mbin.append(np.sqrt(len(gals)) / self.vols[k] / m_range[2])  # n_error
+                else:   # No galaxies in the mass bin
+                    smf_mbin.append(mass)       
+                    smf_mbin.append(np.nan)
+                    smf_mbin.append(np.nan)
+                    smf_mbin.append(np.nan)
 
-                mass += m_range[2]
+                mass += m_range[2]  # Step up to new mass bin
+                smf_info.append(smf_mbin)
 
-            masses.append(m_temp)
-            ns.append(n_temp)
-
+            self.smfs[k] = np.array(smf_info)     # Add the info for the current key
 
 
     # ====================================================================
-    
+
+
+    def SMF_plot(self, keys, labels, plot=""):
+        """
+        
+        """
+        for i, k in enumerate(keys):
+            plt.errorbar(self.smfs[k][:,0], self.smfs[k][:,2], self.smfs[k][:,3], label=labels[i], marker="o", ls='')
+        
+        plt.yscale("log")
+        plt.legend()
+
+        if plot != "":
+            try:
+                plt.savefig(plot)
+            except:
+                os.mkdir(plot)
+                plt.savefig(plot)
+        else:
+            plt.show()
 
 
     def update_Voxels(self, sig_cube) -> None:
@@ -485,25 +504,29 @@ class GalPop:
         back in to other objects later
         """
         # Make inital headers
-        header = ["ra", "dec", "z", "ms", "vx", "vy", "vz", "ODs", "n_sigmas"]
+        header = ["ID", "ra", "dec", "z", "ms", "vx", "vy", "vz", "ODs", "n_sigmas"]
 
         # Make a NaN array to fill the gaps
-        save_array = np.empty((len(self.ms), 9+len(self.pks))) 
+        save_array = np.empty((len(self.coords), len(header)+len(self.pks))) 
         save_array.fill(np.nan)
 
-        if len(self.coords) != 0:
-            save_array[:, 0:3] = self.coords
-        if len(self.ms) != 0:
-            save_array[:,3] = self.ms
-        if len(self.voxels) != 0:
-            save_array[:, 4:7] = self.voxels
-        if len(self.ODs) != 0:
-            save_array[:,7] = self.ODs
-        if len(self.n_sigmas) != 0:
-            save_array[:,8] = self.n_sigmas
 
-        for idx, sig in enumerate(self.pks):
-            save_array[:,9+idx] = self.pks[sig]
+        if len(self.IDs) != 0:
+            save_array[:,0] = self.IDs
+        if len(self.coords) != 0:
+            save_array[:, 1:4] = self.coords
+        if len(self.ms) != 0:
+            save_array[:,4] = self.ms
+        if len(self.voxels) != 0:
+            save_array[:, 5:8] = self.voxels
+        if len(self.ODs) != 0:
+            save_array[:,8] = self.ODs
+        if len(self.n_sigmas) != 0:
+            save_array[:,9] = self.n_sigmas
+
+        for sig in self.pks:
+            # Note this updates length of header, so column number also updates
+            save_array[:,len(header)] = self.pks[sig]
             header.append(str(sig))
         
         # Save to structured array
@@ -526,7 +549,8 @@ class GalPop:
         except:
             print("There were problems loading the following file:\n ", path)
             return
-
+        
+        self.IDs = data["ID"]
         self.coords = np.c_[data["ra"], data["dec"], data["z"]]    # Galaxy coordinates
         self.ms = data["ms"]     # Galaxy masses
 
@@ -544,9 +568,9 @@ class GalPop:
             self.n_sigmas = data["n_sigmas"]
 
         # Load peak numbers if reported
-        if len(data.dtype.names) > 9:
-            for idx in range(len(data.dtype.names) - 9):
-                self.pks[float(data.dtype.names[idx+9])] = data[data.dtype.names[idx+9]]
+        if len(data.dtype.names) > 10:
+            for idx in range(len(data.dtype.names) - 10):
+                self.pks[data.dtype.names[idx+10]] = data[data.dtype.names[idx+10]]
 
 
     # ====================================================================
