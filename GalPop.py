@@ -7,6 +7,7 @@ from astropy.cosmology import FlatLambdaCDM
 import os
 cosmo = FlatLambdaCDM(H0=70, Om0=0.3)
 import matplotlib.gridspec as gridspec
+from scipy.optimize import curve_fit
 
 
 
@@ -55,8 +56,9 @@ class GalPop:
         self.subpops = {}   # Create samples based on sigma-cuts
         self.vols = {}      # volumes of the sigma cuts
         self.smfs = {}      # smf information stored as [[m1, N1, n1, n_error1], ...] for each value
+        self.fits = {}      # Fits to the smfs. Data is stored depending on type of fit (see self.fit_SMF)
 
-
+        
     # ====================================================================
 
 
@@ -366,16 +368,18 @@ class GalPop:
 
     # ====================================================================
 
-    def SMF(self, key_names, m_range):
+    def make_SMF(self, subPop_keys, smf_keys ,m_range):
         """
         Generates SMFs based on the key-names associated with different subpops. 
 
         INPUTS:
-            - key_names (array) =  keys for self.subpops dictionary. These are the sub pops which will have an SMF generate for them
+            - subPop_keys (array) =  keys for self.subpops dictionary. These are the sub pops which will have an SMF generated for them
+            - smf_keys  (array) = key names in the self.smfs dictionary to store the smf info
+                - NOTE: Info is stored as an array of [[m, N, n, n_error], ...] for each key.
             - m_range (array) = mass-range to generate the SMF for
                 - [min_mass, max_mass, m_step]
         """
-        for k in key_names:
+        for sk, k in zip(subPop_keys, smf_keys):
 
             smf_info = []       # Store smf info for this key as [[m, N, n, n_err], ...]
             mass = m_range[0]   # keep track of mass
@@ -400,21 +404,58 @@ class GalPop:
                 mass += m_range[2]  # Step up to new mass bin
                 smf_info.append(smf_mbin)
 
-            self.smfs[k] = np.array(smf_info)     # Add the info for the current key
+            self.smfs[sk] = np.array(smf_info)     # Add the info for the current key
 
 
     # ====================================================================
 
 
-    def SMF_plot(self, keys, labels, plot=""):
+    def SMF_plot(self, smf_keys, smf_labels, fit_keys, fit_labels, title="", plot=""):
         """
-        
+        Plot different SMFs together
+
+        INPUTS:
+            - smf_keys (array)  = Keys in self.smfs to plot
+            - smf_labels    (array) = Plot labels for the smf_keys
+            - fit_keys  (array) = Keys in self.fits to plot
+            - fit_labels    (array) = Plot labels for the fit_keys
+            - title (str)   = Title of the plot. If '', title it "SMF"
+            - plot (str)    = Path to save the string at. If '', then it shows the plot.
         """
-        for i, k in enumerate(keys):
-            plt.errorbar(self.smfs[k][:,0], self.smfs[k][:,2], self.smfs[k][:,3], label=labels[i], marker="o", ls='')
+        colors = ['006BA4', 'FF800E', 'ABABAB', '595959', '5F9ED1', 'C85200']  
+        shapes = ["o", "H", "P", "s", "D", (5,1,0)]
+        min_m, max_m = 99, -99  # For plot limits
+        for i, k in enumerate(smf_keys):
+            try:
+                plt.errorbar(self.smfs[k][:,0], self.smfs[k][:,2], self.smfs[k][:,3], 
+                             label=smf_labels[i], marker=shapes[i], color=colors[i], ls='')
+                min_m = min(min_m, min(self.smfs[k][:,0]))
+                max_m = max(max_m, max(self.smfs[k][:,0]))
+            except: print(f"The key {k} is not in self.smfs. Generate the smf and run again")
+        # Fix up mass limits
+        min_m = 8.5 if min_m==99 else min_m-0.5
+        max_m = 12 if max_m==-99 else max_m+0.5
+
+        for i, k in enumerate(fit_keys):
+            try:    
+                params = self.fits[fit_keys]
+            except: print(f"The key {k} is not in self.fits. Generate the fit and run again")
+            m_vals = np.linspace(min_m, max_m, 1000)
+
+            if len(params) == 3:    # Single Schechter fit
+                plt.plot(m_vals, self.schechter(m_vals, *params), color=colors[i], marker='', label=fit_labels[i])
+            else:    # Double Schechter fit
+                plt.plot(m_vals, self.Dschechter(m_vals, *params), color=colors[i], marker='', label=fit_labels[i])
+      
         
         plt.yscale("log")
-        plt.legend()
+        if (len(smf_keys)==0) or (len(fit_keys==0)): plt.legend(loc='lower left')
+        else: plt.legend(loc='lower left', ncol=2)
+        if title=="": plt.title("SMF") 
+        else: plt.title(title)
+        plt.ylabel(r"$\rm \phi \quad [N\, cMpc^{-3}\,dex^{-1}]$", fontsize=15)
+        plt.xlabel(r"$\rm \log_{10}(M_*/M_\odot)$", fontsize=15)    
+        plt.xlim(min_m, max_m)
 
         if plot != "":
             try:
@@ -424,6 +465,115 @@ class GalPop:
                 plt.savefig(plot)
         else:
             plt.show()
+
+
+    # ====================================================================
+
+    def SMF_relPlot(self, base_key, base_label, smf_keys, smf_labels, title="", plot=""):
+        """
+        Plot SMFs relative to a single one (i.e. the ratio of the smfs to the base-smf)
+
+        INPUTS:
+            - base_key (key)    = Key in self.smfs to use as the normalizing smf
+            - base_label (str)  = label for the base smf in the y_axis (i.e. \phi_{base_label})
+            - smf_keys (array)  = Keys in self.smfs to plot normalized by the base-smf
+            - smf_labels    (array) = Plot labels for the smf_keys
+            - title (str)   = Title of the plot. If '', title it "SMF"
+            - plot (str)    = Path to save the string at. If '', then it shows the plot.
+        """
+        colors = ['006BA4', 'FF800E', 'ABABAB', '595959', '5F9ED1', 'C85200']  
+        shapes = ["o", "H", "P", "s", "D", (5,1,0)]
+        min_m, max_m = 99, -99  # For plot limits
+        try:
+            norms = self.smfs[base_key][:,2]
+        except:
+            print(f"The key {base_key} is not in self.smfs. Generate the smf and run again")
+            return
+        
+        for idx, k in enumerate(smf_keys):
+            try:
+                # Set length of normalizing array
+                if len(norms) > len(smf_keys[k]): 
+                    n = norms[:len(smf_keys[k])]   # Shorten normalizing array
+                    data = smf_keys[k] / n
+                else:   # Shorten data
+                    data = smf_keys[k][:len(norms)] / norms
+                plt.errorbar(data[:,0], data[:,2], data[:,3], 
+                             label=smf_labels[idx], marker=shapes[idx], color=colors[idx])
+                min_m = min(min_m, min(self.smfs[k][:,0]))
+                max_m = max(max_m, max(self.smfs[k][:,0]))
+            except: print(f"The key {k} is not in self.smfs. Generate the smf and run again")
+
+        plt.yscale("log")
+        plt.legend(loc='lower left')
+        if title=="": plt.title("SMF") 
+        else: plt.title(title)
+        plt.ylabel(rf"$\rm \phi/\phi_{base_label}$", fontsize=15)
+        plt.xlabel(r"$\rm \log_{10}(M_*/M_\odot)$", fontsize=15)    
+        plt.xlim(min_m, max_m)
+
+        if plot != "":
+            try:
+                plt.savefig(plot)
+            except:
+                os.mkdir(plot)
+                plt.savefig(plot)
+        else:
+            plt.show()
+
+    # ====================================================================
+
+
+    def fit_SMF(self, smf_keys, fit_keys, N_schechters, **kwargs):
+        """
+        Fits either a single or double schechter function to a given SMF. Fits are done with scipy.optimize.curve_fit
+
+
+        INPUTS:
+            - smf_key (array)   = Key names for SMF in self.smfs to fit (see self.make_SMF)
+            - fit_key (array)   = Key names for this fit in the self.fits dict. The fit is stored as:
+                - 1 (single)      --> [M_star, phi_star, alpha]
+                - 2 (double)      --> [M_star, phi_s1, phi_s2, alpha_1, alpha_2]
+            - N_schechter (array) = Either 1 (single) or 2 (double) schechter.
+            - **kwargs         = Optional variables for curve_fit
+        """
+        for s_key, f_key, Ns in zip(smf_keys, fit_keys, N_schechters):
+
+
+            if Ns == 1:     fit_fn = self.schechter
+            elif Ns == 2:   fit_fn = self.Dschechter
+            else:   
+                print("Elements of N_schechter must be either 1 or 2")
+                return
+
+            f_err, f_params = curve_fit(fit_fn, self.smfs[s_key][:,0], self.smfs[s_key][:,2], sigma=self.smfs[s_key][:,3],
+                                        *kwargs.values())
+            self.fits[f_key] = f_params
+
+
+
+
+
+    
+    def schechter(M, M_star, phi_star, alpha):
+        """
+        Single-Schecter Function
+        """
+        return np.log(10)*phi_star*10**((M-M_star)*(1+alpha))*np.exp(-10**(M-M_star))
+    
+    def Dschechter(M, M_star, phi_s1, phi_s2, alpha_1, alpha_2):
+        """
+        Double-Schechter function
+        """
+        return np.log(10)*np.exp(-10**(M-M_star))*(phi_s1*(10**(M-M_star))**(alpha_1+1) \
+        +phi_s2*(10**(M-M_star))**(alpha_2+1) )
+
+
+
+
+    # ====================================================================
+
+
 
 
     def update_Voxels(self, sig_cube) -> None:
@@ -488,6 +638,56 @@ class GalPop:
         
 
     # ====================================================================
+
+    def combine(self, other):
+        """
+        Combine this instance with another GalPops instance to create a new object. 
+        Verbose for new object is set to True if both have Verbose=True
+            - NOTE: This method is currently is a bit messy with SMFs (and related attributes). It's recommended to 
+            remake the SMFs after combining
+
+        INPUTS:
+            - other (GalPop)    = Other GalPop object to combine with this one
+
+        OUTPUTS:
+            - (GalPoP) = returns a *new* object. This combination does not happen in place
+        """
+        combined_attrs = {}     # where to store the new attributes
+
+        ## Loop through the attributes and combine where possible
+        for attr in self.__dict__:
+
+            self_attr = getattr(self, attr)     # Attrs of this obj
+            other_attr = getattr(other, attr)   # other attrs
+
+            if isinstance(self_attr, np.ndarray): # attr is a list
+                combined_attrs[attr] = np.concatenate((self_attr, other_attr))   
+            elif isinstance(self_attr, dict):   # attr is a dict
+                combined_attrs[attr] = self._combine_dicts(self_attr, other_attr)
+        combined_attrs["verbose"] = bool(self_attr and other_attr)  # set verbose option
+
+        combined_instance = GalPop()
+        for attr, value in combined_attrs.items():
+            setattr(combined_instance, attr, value)
+        return combined_instance
+    
+    def _combine_dicts(self, dict1, dict2):
+        """
+        Helper for self.combine. This combines two dictionary attributes for the two objects
+        """
+        combined_dict = {}
+        for key in set(dict1.keys()).union(dict2.keys()):
+            # Pull the lists from the dictionaries
+            ls1 = dict1.get(key, np.array([]))
+            ls2 = dict2.get(key, np.array([]))
+            # Turn into numpy arrays if needed
+            ls1 = np.array(ls1) if not isinstance(ls1, np.ndarray) else ls1
+            ls2 = np.array(ls2) if not isinstance(ls2, np.ndarray) else ls2
+            combined_dict[key] =  np.concatenate((ls1, ls2))
+        return combined_dict
+
+    # ====================================================================
+
 
     def saveFile(self, path):
         """
@@ -575,19 +775,6 @@ class GalPop:
 
     # ====================================================================
     # ====================================================================
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
