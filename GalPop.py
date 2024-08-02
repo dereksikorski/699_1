@@ -7,6 +7,7 @@ from astropy.cosmology import FlatLambdaCDM
 import os
 cosmo = FlatLambdaCDM(H0=70, Om0=0.3)
 import matplotlib.gridspec as gridspec
+from collections.abc import Iterable
 from scipy.optimize import curve_fit
 
 
@@ -18,7 +19,7 @@ from scipy.optimize import curve_fit
 class GalPop:
 
 
-    def __init__(self, IDs=[], coords=[], ms=[], obs_type = [], n_sigmas=[], ODs=[], pks={},  mags={}, verbose=False) -> None:
+    def __init__(self, IDs=[], coords=[], ms=[], SFRs=[], obs_type = [], n_sigmas=[], ODs=[], pks={},  mags={}, verbose=False) -> None:
         """
         Create a population of galaxies:
         ATTRIBUTES:
@@ -26,7 +27,7 @@ class GalPop:
             - coords (array)    = 2D array of [ra, dec, z] for each galaxy
                 - shape = (# of galaxies, 3)
             - ms    (array)     = array of galaxy masses
-            - obs_type (array)  = Specify if galaxy is photoz (0) or specz (1)
+            - obs_type (array)  = Specify the observation type of the galaxy
             - n_sigmas (array)   = The number of sigma above the mean overdensity in the redshift slice for each galaxy
                         (how find_peaks defines a peak)
                 - shape = (# of Galaxies,)
@@ -43,13 +44,16 @@ class GalPop:
         self.IDs    = IDs       # Galaxy IDs
         self.coords = coords        # Galaxy coords [ [ra1, dec1, z1], [ra2, dec2, z2], ...]
         self.ms = ms  # Mass
+        self.SFRs = SFRs
         self.obs_type = obs_type        # photz or specz
+        
 
         self.n_sigmas = n_sigmas  # Sigma above mean overdensity
         self.ODs = ODs  # Overdensity values
         self.pks = pks  # Peak number dictionary
         self.mags = mags    # Magnitude dictionary
         self.verbose = verbose  # verbose option for printing
+        
 
         ## Interior Variables
         self.voxels = []    # Voxels of each galaxy
@@ -93,8 +97,8 @@ class GalPop:
                 - Meant to stop any accidental replacement of peak info
         """
 
-        if len(self.voxels) == 0:   # Assign each galaxy to a voxel if needed
-            self.update_Voxels(sig_cube)
+        if len(self.n_sigmas) == 0:   # Assign each galaxy to a voxel if needed
+            self.update_n_sigmas(sig_cube)
 
 
         ## For each sigma, test membership and return peak numbers
@@ -223,7 +227,7 @@ class GalPop:
             mask = np.in1d(self.pks[sig_range[1]], g_pks[:,0])   # Make mask for if peak number is in relevant peak
             test_idxs = np.where((self.coords[:,2] >= z_range[0]) & (self.coords[:,2] <= z_range[1])    # In relevant redshift
                             & (self.n_sigmas >= sig_range[0]) & (self.n_sigmas < sig_range[1]) # In relevant overdensity regime
-                            & mask )    # In relevant peak
+                            & mask )[0]    # In relevant peak
             
         ## NO UPPER BOUND (half-open sigma-interval)
         else:   
@@ -231,7 +235,7 @@ class GalPop:
 
             test_idxs = np.where((self.coords[:,2] >= z_range[0]) & (self.coords[:,2] <= z_range[1])    # In relevant redshift
                             & (self.n_sigmas >= sig_range[0])   # In relevant overdensity
-                            & mask )    # In relevant 
+                            & mask )[0]    # In relevant peak
             
         ### SAVE SAMPLE
         self.subpops[key_name] = test_idxs  # Saves the indices of the galaxies that lay in this sample
@@ -278,7 +282,6 @@ class GalPop:
         """
         Helper method for plotting data from the subPop
         """
-
         ra_range = [np.min(self.coords[:,0]), np.max(self.coords[:,0])]
         dec_range = [np.min(self.coords[:,1]), np.max(self.coords[:,1])]
 
@@ -384,6 +387,7 @@ class GalPop:
 
         INPUTS:
             - subPop_keys (array) =  keys for self.subpops dictionary. These are the sub pops which will have an SMF generated for them
+                - NOTE: each element of this array can be either a single key, or a list of keys if combining subPops for one SMF
             - smf_keys  (array) = key names in the self.smfs dictionary to store the smf info
                 - NOTE: Info is stored as an array of [[m, N, n, n_error], ...] for each key.
             - m_range (array) = mass-range to generate the SMF for
@@ -391,14 +395,15 @@ class GalPop:
         """
         for sk, k in zip(subPop_keys, smf_keys):
 
-            if isinstance(sk, list):
-                masses = self.ms[self.subpops[sk[0]]] 
-                vol = self.vols[sk[0]]
-                for sk_sub in sk[1:]: 
+            # If combining multiple subpops for one SMF, combine those
+            if self.isIt(sk):
+                masses = self.ms[self.subpops[sk[0]]]   # initialize list of masses
+                vol = self.vols[sk[0]]      # initialize volume
+                for sk_sub in sk[1:]:   # loop through remaining keys and combine masses and volume
                     masses = np.concatenate((masses, self.ms[self.subpops[sk_sub]] ))
                     vol += self.vols[sk_sub]
 
-            else:
+            else:   # if just looking at one key
                 masses = self.ms[self.subpops[sk]] 
                 vol = self.vols[sk]
 
@@ -678,14 +683,15 @@ class GalPop:
 
             self_attr = getattr(self, attr)     # Attrs of this obj
 
-            if isinstance(self_attr, np.ndarray) and (len(self_attr)!=0): # attr is a nonempty list
+            # Delete in non-empty iterables (excluding dictionaries)
+            if self.isIt(self_attr) and (len(self_attr)!=0):
+
                 setattr(self, attr, np.delete(self_attr,idxs, axis=0) )
 
             elif isinstance(self_attr, dict):   # attr is a dict
                 temp_dict = {}
                 for k in self_attr:
-                    if isinstance(self_attr[k], np.ndarray) and (len(self_attr[k])!=0):
-                        temp_dict[k] = np.delete(self_attr[k], idxs)
+                    temp_dict[k] = np.delete(self_attr[k], idxs)
                 setattr(self, attr, temp_dict)
 
 
@@ -712,7 +718,7 @@ class GalPop:
             self_attr = getattr(self, attr)     # Attrs of this obj
             other_attr = getattr(other, attr)   # other attrs
 
-            if isinstance(self_attr, np.ndarray): # attr is a list
+            if self.isIt(self_attr): # attr is a list
                 combined_attrs[attr] = np.concatenate((self_attr, other_attr))   
             elif isinstance(self_attr, dict):   # attr is a dict
                 combined_attrs[attr] = self._combine_dicts(self_attr, other_attr)
@@ -722,6 +728,9 @@ class GalPop:
         for attr, value in combined_attrs.items():
             setattr(combined_instance, attr, value)
         return combined_instance
+    
+    # ====================================================================
+
     
     def _combine_dicts(self, dict1, dict2):
         """
@@ -740,59 +749,52 @@ class GalPop:
 
     # ====================================================================
 
+    def create_LP_cat(self):
 
-    def saveFile(self, path):
-        """
-        Saves most attributes at the path using np.save --> file type must be .npy! Note that all attributes will be saved. The
-        columns of the resulting .npy file are:
-            - 0-2 = ra, dec, z
-            - 3 = mass
-            - 4-6 = voxel-x, voxel-y, voxel-z
-            - 7 = n_sigmas
-            - 8 = ODs
-            - 9+ = peak number at given sigma-threshold
+        cat = np.zeros(shape=(len(self.IDs), len(self.mags) + 3))
 
-        Note that any column 5-9 that does not have data will be marked with NaNs in the file. This file structure can be read
-        back in to other objects later
-        """
-        # Make inital headers
-        header = ["ID", "ra", "dec", "z", "ms", "vx", "vy", "vz", "ODs", "n_sigmas"]
-
-        # Make a NaN array to fill the gaps
-        save_array = np.empty((len(self.coords), len(header)+len(self.pks))) 
-        save_array.fill(np.nan)
-
-
-        if len(self.IDs) != 0:
-            save_array[:,0] = self.IDs
-        if len(self.coords) != 0:
-            save_array[:, 1:4] = self.coords
-        if len(self.ms) != 0:
-            save_array[:,4] = self.ms
-        if len(self.voxels) != 0:
-            save_array[:, 5:8] = self.voxels
-        if len(self.ODs) != 0:
-            save_array[:,8] = self.ODs
-        if len(self.n_sigmas) != 0:
-            save_array[:,9] = self.n_sigmas
-
-        for sig in self.pks:
-            # Note this updates length of header, so column number also updates
-            save_array[:,len(header)] = self.pks[sig]
-            header.append(str(sig))
+        cat[:,0] = self.IDs # Update IDs
         
-        # Save to structured array
-        dtype = [(h, "f8") for h in header]
-        structured = np.zeros(save_array.shape[0], dtype=dtype)
+        for i, m in enumerate(self.mags):
+            cat[:,1+i] = self.mags[m]   # Update mags and errors
 
-        for i, h in enumerate(header):
-            structured[h] = save_array[:,i]
+        cat[:,-2] = np.zeros(len(cat))  # Context
+        cat[:,-1] = self.coords[:,2]    # Redshift
+        
+        return cat
 
-        np.save(path, structured)  # Save to path
+
 
     # ====================================================================
-    
-    def loadFile(self, path):
+
+
+    def saveFile(self, path, ex=[]):
+        """Save the object to a .npy file at the specified path, excluding specified attributes."""
+        data = {key: value for key, value in self.__dict__.items() if key not in ex}
+        np.save(path, data)
+        if self.verbose:
+            print(f"Saved GalPop object to {path}, excluding {ex}")
+
+    # ====================================================================
+
+
+    @classmethod
+    def loadFile(cls, path):
+        """Load the object from a .npy file at the specified path."""
+        data = np.load(path, allow_pickle=True).item()
+        if not isinstance(data, dict):
+            raise ValueError("Loaded data is not a dictionary. Ensure the file contains the correct data structure.")
+        
+        obj = cls()
+        obj.__dict__.update(data)
+        if obj.verbose:
+            print(f"Loaded GalPop object from {path}")
+        return obj
+ 
+    # ====================================================================
+
+
+    def loadFile_old(self, path):
         """
         Loads files assuming the same structure as saveFile. Fills in attributes where appropriate.
         """
@@ -822,6 +824,18 @@ class GalPop:
 
                 self.pks[float(data.dtype.names[idx+10])] = data[data.dtype.names[idx+10]]
                 # print(self.pks)
+
+
+    def isIt(self, it, ex=[dict, str]):
+        """
+        Given some object "it", check if it is an Iterable, excluding types in the list "ex"
+        """
+        result = isinstance(it, Iterable)   # First check if it's iterable
+        for t in ex:
+            result = result and not isinstance(it, t)       # Check if it is any of the excluded types
+        return result
+
+
 
     # ====================================================================
     # ====================================================================
