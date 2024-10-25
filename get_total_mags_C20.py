@@ -14,17 +14,17 @@ def get_total_mags_C20(filename=r"C:/Users/sikor/OneDrive/Desktop/BigData/COSMOS
     'UVISTA_Y', 'UVISTA_J', 'UVISTA_H', 'UVISTA_Ks', 'SC_IB427', 'SC_IB464', 'SC_IA484',\
     'SC_IB505', 'SC_IA527', 'SC_IB574', 'SC_IA624', 'SC_IA679', 'SC_IB709', 'SC_IA738',\
     'SC_IA767', 'SC_IB827', 'SC_NB711', 'SC_NB816', 'UVISTA_NB118', 'SC_B', 'SC_V',\
-    'SC_rp', 'SC_ip', 'SC_zpp', 'IRAC_CH1', 'IRAC_CH2', 'SPLASH_CH3', 'SPLASH_CH4', 'GALEX_FUV', 'GALEX_NUV']
+    'SC_rp', 'SC_ip', 'SC_zpp', 'IRAC_CH1', 'IRAC_CH2','GALEX_FUV', 'GALEX_NUV']
   AlambdaDivEBV = [4.674, 4.807, 3.69, 2.715, 2.0, 1.515, 1.298,\
     1.213, 0.874, 0.565, 0.365, 4.261, 3.844, 3.622,\
     3.425, 3.265, 2.938, 2.694, 2.431, 2.29, 2.151,\
     1.997, 1.748, 2.268, 1.787, 0.946, 4.041, 3.128,\
-    2.673, 2.003, 1.466, 0.163, 0.112, 0.075, 0.045, 8.31, 8.742]
+    2.673, 2.003, 1.466, 0.163, 0.112, 8.31, 8.742]
 
   aperture = aperture # ["]
   offset = data['total_off'+str(aperture)]
   ebv    = data['EBV_MW']
-  names_noaper = ['SPLASH_CH3', 'SPLASH_CH4', 'IRAC_CH1', 'IRAC_CH2', 'GALEX_FUV', 'GALEX_NUV']
+  names_noaper = ['IRAC_CH1', 'IRAC_CH2', 'GALEX_FUV', 'GALEX_NUV']
 
   for i,name in enumerate(filtnames):
     if name not in names_noaper:
@@ -97,7 +97,7 @@ np.save(r"C:/Users/sikor/OneDrive/Desktop/BigData/COSMOS2020/C20_Fluxes.npy", d_
 
 
 ## Make new object
-p_data = GalPop.loadFile("GalPops_phot/c20p.npy")
+p_data = GalPop.loadFile("OG_c20p.npy")
 p_data.verbose=False
 
 
