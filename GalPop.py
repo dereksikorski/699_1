@@ -154,14 +154,14 @@ class GalPop:
 
 
 
-    def subPop(self, key_name, sig_range, min_mass, z_range, pk_path, pk_sum, sig_cube, pk_nums = [], cosmo = None, plot="None"):
+    def subPop(self, key_name, sig_range, min_mass, z_range, pk_path, pk_sum, sig_cube, pk_nums = [], pk_folder='None', cosmo = None, plot="None"):
         """
         INPUTS:
             - key_name (str/float)  = key for self.subpops dictionary and self.vols dictionary where info from this is stored
             - sig_range  (array) = Define the range of overdensities to test [sig_min , sig_max). Note if sig_min != -99 or
-                sig_max != np.inf, they should correspond to a key in the self.pks dict set via self.assignPeaks
+                - sig_max != np.inf, they should correspond to a key in the self.pks dict set via self.assignPeaks
                 - If sig_max == np.inf, report all galaxies above sig_min. 
-                - If sig_min == -99, report all galaxies outside of peaks with a voxel above sig_max
+                - If field (i.e. pk_folder != 'None'), sig_min defines potential protostuctures and sig_max confirms a protostructure
             - min_mass (float)  =  Mass-cutoff for peaks
             - z_range    (array) = Define the redshift range to look at [z_min, z_max]
             - pk_path (str)    - The path to the directory containing all of the find_peaks information 
@@ -170,6 +170,7 @@ class GalPop:
             - sig_cube (.fits)  - The fits file containing the sigma-cube from find_peaks
             - pk_nums (list)    = List of the peak numbers to test for (note not the peak index, but peak number)
                     - If [], it tests all peaks
+            - pk_folder (str)   - Path the folder containing peak info related to the pk_sum (only needed for field)
             - cosmo (astropy cosmology) = Cosmology to calculate field volume if applicable
             - plot (str)    - Plotting option -- Plots via helper method
                 - "None" = No plots
@@ -197,15 +198,12 @@ class GalPop:
 
         b_coords = np.c_[bRAs, np.c_[bdecs, bzs]]   # Pack peak coordinates into array
 
-        # Make cuts to find relevant peaks in the summary file
-        if len(pk_nums) == 0:
-            g_idxs = np.where((b_coords[:,2] >= z_range[0]) & (b_coords[:,2] <= z_range[1])  # redshifts
-                    & (pk_sum[:,11] >= min_mass) )                # Masses
-        else:
-            g_idxs = np.where((b_coords[:,2] >= z_range[0]) & (b_coords[:,2] <= z_range[1])  # redshifts
+        ## Make cut on relevant peaks based on mass, redshift, and specified pk numbers
+        if len(pk_nums) == 0: pk_nums = pk_sum[:,0]     # If no pks specified, assume all are ok
+
+        g_idxs = np.where((b_coords[:,2] >= z_range[0]) & (b_coords[:,2] <= z_range[1])  # redshifts
                     & (pk_sum[:,11] >= min_mass)                 # Masses
                     & (np.isin(pk_sum[:,0], pk_nums))  )    # Make sure the peak number is one that is wanted
-
 
         g_pks = pk_sum[g_idxs]      # List of relevant peak information
         g_coords = b_coords[g_idxs] # list of barycenter coordinates of relevant peaks
@@ -214,7 +212,7 @@ class GalPop:
         ### DEFINE GAL SAMPLE IN SIGMA-RANGE
 
         ## FIELD (no lower limit)
-        if sig_range[0] == -99: 
+        if pk_folder != 'None': 
 
             bad_Vol = 0  # Volume of potential structures in field
             test_idxs = np.where((self.coords[:,2] >= z_range[0]) & (self.coords[:,2] <= z_range[1]) )[0] # Gals in redshift range
@@ -222,11 +220,16 @@ class GalPop:
             # Loop through each peak, find max mass, and remove gals from field if they're in a protostructure
             for pk in g_pks:
                 pk_gal_idxs = np.where((self.coords[:,2] >= z_range[0]) & (self.coords[:,2] <= z_range[1])    # In relevant redshift
-                            & (self.pks[2.0] == pk[0]) )[0]       # In the peak #----------------------------------------------------------------------------------------------------------------------------------
+                            & (self.pks[sig_range[0]] == pk[0]) )[0]   
                 
                 # If max n-sigma is greater than max sigma entered, remove all these galaxies from the field
                 if len(pk_gal_idxs) != 0:
-                    if np.max(self.n_sigmas[pk_gal_idxs]) >= sig_range[1]:
+                    try:    # If non-single-digit peak (e.g., 10, 25, 102, etc)
+                        p_data = np.genfromtxt(pk_path+pk_folder+"\\"+f"pixels_{int(pk[0])}.dat", comments = '#')
+                    except: # If single digit peak (e.g., 1, 2, 3, etc)
+                        p_data = np.genfromtxt(pk_path+pk_folder+"\\"+f"pixels_0{int(pk[0])}.dat", comments = '#')
+
+                    if np.max(p_data[:,3]) >= sig_range[1]:
                         bad_Vol += pk[10]   # Add volume of peak to bad volume
                         # Remove all the indices from the list of good indices
                         bad_ids = np.in1d(test_idxs, pk_gal_idxs)
