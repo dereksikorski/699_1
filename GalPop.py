@@ -11,6 +11,10 @@ from collections.abc import Iterable
 from scipy.optimize import curve_fit
 from mpl_toolkits.mplot3d import Axes3D
 from scipy.stats import gaussian_kde
+from tqdm.notebook import tqdm
+from scipy.spatial import KDTree
+from multiprocessing import Pool
+
 
 
 
@@ -80,77 +84,69 @@ class GalPop:
         self.mags[mag_name] = mag_vals
 
 
+
     # ====================================================================
 
-
-    def assignPeaks(self, sigs, sig_cube, pk_path, pk_sums, pk_folders, overwrite = False) -> None:
+    def assignPeaks(self, sigs, sig_cube, sig_summary_files, sig_data_folders, overwrite=False):
         """
-        Assign each galaxy in the galaxy population to a peak given a sigma-threshold to define peaks. Updates the 
-        voxel information for each galaxy if needed and adds an array of peak numbers to the pks dictionary attribute.
+        Assign galaxies to overdensity peaks.
 
-        INPUTS:
-            - sigs  (float)     - The sigma-thresholds. Purely for bookkeeping as these are the keys in self.pks
-            - sig_cube (.fits)  - The output of 'make_cube_final_overdense.py'.
-            - pk_path (str)    - The path to the directory containing all of the find_peaks information 
-                        (i.e. summary files and peak-folders)
-            - pk_sums (array)      - List of the file names of the peak summary files in pk_path to use
-            - pk_folders (array)   - List of the folder names in pk_path to use
-            - overwrite (bool)      - Whether or not to overwrite current peak assignements for threshold
-                - Meant to stop any accidental replacement of peak info
+        Parameters:
+            sigs (list): List of sigma thresholds.
+            sig_summary_files (list): List of summary files for each sigma threshold.
+            sig_data_folders (list): List of directories containing peak voxel data files for each sigma.
+            overwrite (bool): Whether to overwrite existing assignments in self.pks.
         """
-
-        if len(self.n_sigmas) == 0:   # Assign each galaxy to a voxel if needed
+        if not overwrite and self.pks:
+            raise ValueError("Peak assignments already exist. Use overwrite=True to reassign.")
+        
+        if len(self.n_sigmas) == 0:  # Assign each galaxy to a voxel if needed
             self.update_n_sigmas(sig_cube)
 
 
-        ## For each sigma, test membership and return peak numbers
-        for idx, s in enumerate(pk_sums):
-            if (sigs[idx] in self.pks) and (overwrite==False):  # Check if there is existing peak info
-                print(f"Sigma = {sigs[idx]} is already has peak info in self.pks. Specify overwrite=True to change peak info")
-                pass
-            if self.verbose: print(f"Finding peaks for sigma = {sigs[idx]}")
+        # Initialize pks for each sigma
+        self.pks = {sig: [-99] * len(self.voxels) for sig in sigs}
 
-            pk_sum = np.genfromtxt(pk_path + s, dtype=float, skip_header=0)    # Peak summary file
-            pk_dict = {}        # Store info for used peaks to reduce number of file-reads needed
-            pk_numbers = []    # Store peak number for each galaxy
+        # Process each sigma level
+        for sig, summary_file, data_folder in zip(sigs, sig_summary_files, sig_data_folders):
+            # Load the peak summary file
+            pk_sum = np.genfromtxt(summary_file, comments="#")
+            
+            # Extract bounds and peak centers
+            peak_centers = pk_sum[:, 1:4].astype(int)  # Columns 1, 2, 3 are peak center voxels
+            peak_bounds = pk_sum[:, -6:].reshape(-1, 3, 2).astype(int)  # Min/max bounds for x, y, z
+            
+            # Preload peak voxel data into sets for fast lookup
+            peak_voxel_sets = {}
+            for row in pk_sum:
+                peak_id = int(row[0])  # Peak number starts at 1
+                try:
+                    data = np.genfromtxt(f"{data_folder}/pixels_{peak_id:02d}.dat", comments="#")
+                    peak_voxel_sets[peak_id] = set(map(tuple, data[:, :3].astype(int)))
+                except FileNotFoundError:
+                    continue
+            
+            # Create KDTree for peak centers
+            tree = KDTree(peak_centers)
+            max_radius = np.sqrt(np.max((peak_bounds[:, :, 1] - peak_bounds[:, :, 0]) ** 2).sum())
 
-            ## Find peak number for each gal
-            for v in self.voxels:
-                
-                pk = -99    # Initially assign the galaxy to no peak
-
-                ## Loop through each peak until galaxy is placed in one
-                for p in pk_sum:    
-
-                    # Test if gal is within min-max range of peak
-                    if (p[-6]<=v[0] <= p[-5]) and (p[-4]<=v[1]<=p[-3]) and (p[-2]<=v[2]<=p[-1]):
-                        
-                        try:    # Use peak data from dictionary if it's already been loaded
-                            p_data = pk_dict[p[0]]  
-                        except: # Otherwise, load in the peak data
-                            try:    # If non-single-digit peak (e.g., 10, 25, 102, etc)
-                                p_data = np.genfromtxt(pk_path+pk_folders[idx]+"\\"+f"pixels_{int(p[0])}.dat", comments = '#')
-                            except: # If single digit peak (e.g., 1, 2, 3, etc)
-                                p_data = np.genfromtxt(pk_path+pk_folders[idx]+"\\"+f"pixels_0{int(p[0])}.dat", comments = '#')
-
-                            pk_dict[p[0]] = p_data  # Add to dictionary
-
-                        # Check if voxel is actually in the peak
-                        good_voxels = np.where((p_data[:,0] == v[0]) & (p_data[:,1]==v[1]) & (p_data[:,2] == v[2]))[0]
-
-                        if len(good_voxels) != 0:
-                            # Match found! Save the peak number for this galaxy and pass to next galaxy
-                            pk = p[0]   
+            # Assign galaxies to peaks
+            assignments = [-99] * len(self.voxels)  # Initialize with -1 (unassigned)
+            for voxel_idx, voxel in enumerate(self.voxels):
+                # Find nearby peaks using KDTree
+                nearby_indices = tree.query_ball_point(voxel, max_radius)
+                for idx in nearby_indices:
+                    bounds = peak_bounds[idx]
+                    # Check if voxel is within the bounds
+                    if all(bounds[dim, 0] <= voxel[dim] <= bounds[dim, 1] for dim in range(3)):
+                        # Check if voxel is in the voxel set for this peak
+                        peak_id = int(pk_sum[idx, 0])  # Map back to the correct peak number
+                        if tuple(voxel) in peak_voxel_sets.get(peak_id, set()):
+                            assignments[voxel_idx] = peak_id
                             break
-                
-                # Add the peak number for the galaxy
-                pk_numbers.append(pk)
-                        
-            # Add to the peak dictionary under with the sigma-threshold as the key
-            self.pks[sigs[idx]] = np.array(pk_numbers)
 
+            self.pks[sig] = assignments
 
-    # ====================================================================
 
 
 
