@@ -151,7 +151,59 @@ class GalPop:
 
 
 
-    def subPop(self, key_name, sig_range, min_mass, z_range, pk_path, pk_sum, sig_cube, pk_nums = [], pk_folder='None', cosmo = None, plot="None"):
+    def makeField(self, field_name, pk_def, pk_path, pk_sum, pk_folder, cosmo = None, gal_sample = None ):
+        """
+        Used for defining a field population out of some sample of galaxies based on some definition of 'peaks'
+
+        INPUTS:
+            - field_name    = Key name to be stored in self.subpops
+            - pk_def    = [minimum peak sigma, necessary sig to define peak, min peak mass]
+            - cosmo = Cosmology to use for volume (Default to FlatLambdaCDM(H0=70, Om0=0.27))
+            - gal_sample = sub-sample of galaxies to use
+        """
+
+        if cosmo == None: cosmo = FlatLambdaCDM(H0 = 0.70, Om0=0.27)
+
+        pk_sum = np.genfromtxt(pk_path + pk_sum, dtype=float, skip_header=0)    # Peak summary file
+
+
+        pks = np.unique(self.pks[pk_def[0]][gal_sample])
+        pks = pks[pks >= 0]
+
+        b_pks = []
+
+        for p in pk_sum:
+            if p[11] >= pk_def[2]:   # massive enough
+                
+                try:    # If non-single-digit peak (e.g., 10, 25, 102, etc)
+                    p_data = np.genfromtxt(pk_path+pk_folder+"\\"+f"pixels_{int(p[0])}.dat", comments = '#')
+                except: # If single digit peak (e.g., 1, 2, 3, etc)
+                    p_data = np.genfromtxt(pk_path+pk_folder+"\\"+f"pixels_0{int(p[0])}.dat", comments = '#')
+                
+                if np.max(p_data[:,3]) >= pk_def[1]:        # Overdense enough
+                    if np.isin(p[0], pks):      # At least one galaxy in the peak
+                        b_pks.append(int(p[0]))
+        
+        sp = np.logical_and(np.isin(self.pks[pk_def[0]], b_pks, invert=True), np.isin(list( range(len(self.IDs))), gal_sample))
+
+        bad_vol = np.sum(pk_sum[:,10][b_pks])
+
+        lz, hz = np.min(self.coords[:,2][sp]), np.max(self.coords[:,2][sp])
+
+        theta_dec = np.abs(np.max(self.coords[sp][:,1])-np.min(self.coords[sp][:,1]))*np.pi/180 
+        theta_RA  = np.abs(np.max(self.coords[sp][:,0])-np.min(self.coords[sp][:,0]))*np.pi/180  * np.cos(theta_dec)
+        Omega     = theta_RA * theta_dec # get rid of unit
+        V_cube  = Omega/(4*np.pi) *(cosmo.comoving_volume(hz) - cosmo.comoving_volume(lz))
+        Vol = V_cube.value - bad_vol
+
+
+        self.subpops[field_name] = sp
+        self.vols[field_name] = Vol
+
+
+
+
+    def subPop(self, key_name, sig_range, min_mass, z_range, pk_path, pk_sum, sig_cube, pk_nums = [], pk_folder='None', cosmo = None, plot="None", gal_sample=None):
         """
         INPUTS:
             - key_name (str/float)  = key for self.subpops dictionary and self.vols dictionary where info from this is stored
@@ -184,7 +236,6 @@ class GalPop:
 
         if self.verbose:
             print(f"Finding the subpopulation in the peak {key_name}")
-
 
         pk_sum = np.genfromtxt(pk_path + pk_sum, dtype=float, skip_header=0)    # Peak summary file
         
@@ -237,7 +288,7 @@ class GalPop:
             mask = np.in1d(self.pks[sig_range[0]], g_pks[:,0])   # Make mask for if peak number is in relevant peak
             test_idxs = np.where((self.coords[:,2] >= z_range[0]) & (self.coords[:,2] <= z_range[1])    # In relevant redshift
                             & (self.n_sigmas >= sig_range[0]) & (self.n_sigmas < sig_range[1]) # In relevant overdensity regime
-                            & mask )[0]    # In relevant peak
+                            & mask & gal_sample )[0]    # In relevant peak
             
         ## NO UPPER BOUND (half-open sigma-interval)
         else:   
@@ -245,7 +296,7 @@ class GalPop:
 
             test_idxs = np.where((self.coords[:,2] >= z_range[0]) & (self.coords[:,2] <= z_range[1])    # In relevant redshift
                             & (self.n_sigmas >= sig_range[0])   # In relevant overdensity
-                            & mask )[0]    # In relevant peak
+                            & mask & gal_sample)[0]    # In relevant peak
             
         ### SAVE SAMPLE
         self.subpops[key_name] = np.isin(range(len(self.IDs)), test_idxs )   # Saves the bools for which indices are in the subpop
@@ -253,8 +304,9 @@ class GalPop:
         ### FIND VOLUMES
 
         ## Not the field
-        if sig_range[0] != -99:
+        if pk_folder == 'None':
             rel_sig = int(not(sig_range[1] == np.inf))  # 0 if upper limit is inf, 1 otherwise
+
             unique_peaks = np.unique(self.pks[sig_range[rel_sig]][test_idxs]) # Find peak numbers that have a galaxy in them
             Vol = np.sum(pk_sum[np.argmin(np.abs(unique_peaks[:,np.newaxis] - pk_sum[:,0]), axis=1)][:,10])     # sum the volumes of the peaks
 
@@ -266,6 +318,8 @@ class GalPop:
                 print("Unable to calculate Volume due to missing Cosmology")
                 return
             ## Subtract volume of protostructures from the cube
+            test_idxs = np.where((self.coords[:,2] >= z_range[0]) & (self.coords[:,2] <= z_range[1]) )[0] # Gals in redshift range
+            print(test_idxs)
             theta_dec = np.abs(np.max(self.coords[test_idxs][:,1])-np.min(self.coords[test_idxs][:,1]))*np.pi/180 
             theta_RA  = np.abs(np.max(self.coords[test_idxs][:,0])-np.min(self.coords[test_idxs][:,0]))*np.pi/180  * np.cos(theta_dec)
             Omega     = theta_RA * theta_dec # get rid of unit
