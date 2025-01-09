@@ -3,11 +3,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 from astropy.io import fits
 from time import time
+import astropy.cosmology
 from astropy.cosmology import FlatLambdaCDM
 import os
-cosmo = FlatLambdaCDM(H0=70, Om0=0.3)
+cosmo = FlatLambdaCDM(H0=70, Om0=0.27)
 import matplotlib.gridspec as gridspec
-from collections.abc import Iterable
 from scipy.optimize import curve_fit
 from mpl_toolkits.mplot3d import Axes3D
 from scipy.stats import gaussian_kde
@@ -15,6 +15,7 @@ from tqdm.notebook import tqdm
 from scipy.spatial import KDTree
 from multiprocessing import Pool
 from typing import *
+import warnings
 
 
 
@@ -26,90 +27,146 @@ from typing import *
 class GalPop:
 
 
-    def __init__(self, IDs=[], coords=[], ms=[], SFRs=[], obs_type = [], n_sigmas=[], ODs=[], pks={},  mags={}, verbose=False, misc={}) -> None:
+    def __init__(self,   IDs: Iterable,   coords: Iterable[Iterable[int]],     ms: Iterable[float],
+        *,
+        mags: dict[str, Iterable[float]] = None,     verbose: bool = False,    misc: dict = None ) -> None:
         """
-        Create a population of galaxies:
-        ATTRIBUTES:
-            - IDs   (array)     = array of IDs for the galaxies
-            - coords (array)    = 2D array of [ra, dec, z] for each galaxy
-                - shape = (# of galaxies, 3)
-            - ms    (array)     = array of galaxy masses
-            - obs_type (array)  = Specify the observation type of the galaxy
-            - n_sigmas (array)   = The number of sigma above the mean overdensity in the redshift slice for each galaxy
-                        (how find_peaks defines a peak)
-                - shape = (# of Galaxies,)
-            - ODs   (array)    = The overdensity values for each galaxy 
-                - shape = (# of Galaxies,)
-            - pks (dict)    = The peak number that a given galaxy is located in for each sigma-threshold. Form {sig_number: array_of_pks}
-                - Note this is the peak number in the peak-summary file in which the first peak is n=1 (rather than n=0).
-                  If not in a peak, then peak number = -99
-            - mags  (dict)      = Dictionary of magnitudes with form {band_name : array_of_mags}
-                - Can be added after initialization with "addMag"
-            - verbose (bool)    = If changed to True, each method call prints updates to track progress
-        """
-        ## Optional Variables
-        self.IDs    = IDs       # Galaxy IDs
-        self.coords = coords        # Galaxy coords [ [ra1, dec1, z1], [ra2, dec2, z2], ...]
-        self.ms = ms  # Mass
-        self.SFRs = SFRs
-        self.obs_type = obs_type        # photz or specz
-        
+        Initialize a population of galaxies.
 
-        self.n_sigmas = n_sigmas  # Sigma above mean overdensity
-        self.ODs = ODs  # Overdensity values
-        self.pks = pks  # Peak number dictionary
-        self.mags = mags    # Magnitude dictionary
-        self.verbose = verbose  # verbose option for printing
-        self.misc= misc
-        
+        Parameters
+        ----------
+        IDs : Iterable
+            Array of unique IDs for each galaxy in the population.
+        coords : Iterable[Iterable[int]]
+            2D array of [ra, dec, z] for each galaxy. Shape: (# of galaxies, 3).
+        ms : Iterable[float]
+            Array of galaxy masses.
+
+        Optional Parameters
+        ---------
+
+        mags : dict[str, Iterable[float]], optional
+            Dictionary of magnitudes with {band_name: array_of_mags}. Defaults to None.
+        verbose : bool, optional
+            If True, print progress during method calls. Defaults to False.
+        misc : dict, optional
+            Additional miscellaneous information. Defaults to None.
+
+        Attributes
+        ----------
+        IDs : Iterable
+            Unique galaxy identifiers.
+        coords : Iterable[Iterable[int]]
+            3D galaxy coordinates.
+        ms : Iterable[float]
+            Galaxy masses.
+        mags : dict[str, Iterable[float]]
+            Magnitudes for different bands.
+        verbose : bool
+            Verbosity of logging.
+        misc : dict
+            Miscellaneous attributes.
+
+        Internal Attributes
+        --------
+
+        voxels : Iterable[Iterable[float]]  --> Derived in update_voxels()
+            3D voxel coordinates [x,y,z] for each derived from a given VMC map
+        ODs : Iterable[float]   --> Derived in update_ODs()
+            Overdensity values for each galaxy
+        n_sigmas : Iterable[float]  --> Derived in update_n_sigmas()
+            Number of standard deviations above the average overdensity for a given galaxy
+        pks : Dict[ (int|float)  ,  Iterable ]  --> Derived in assign_peaks()
+            Dictionary of peak numbers for each galaxy given a set of results from find_peaks.py
+        subpops : Dict[ (str|float) , Iterable[bool]] --> Derived in make_field() or make_sp()
+            Dictionary of bool for each galaxy for if it is in a defined subpopulation or not
+        vols : Dict[ (str|float), float]    --> Derived in make_field() or make_sp()
+            Dictionary of volume (cMpc^3) a given subpopulation is located within
+        """
+
+        ## Mandatory attributes
+        self.IDs = IDs  # Galaxy IDs
+        self.coords = coords  # Galaxy coords [ [ra1, dec1, z1], [ra2, dec2, z2], ...]
+        self.ms = ms  # Mass
+
+        ## Optional attributes
+        self.mags = mags or {}  # Magnitude dictionary
+        self.verbose = verbose  # Verbose option for printing
+        self.misc = misc or {}
 
         ## Interior Variables
-        self.voxels = []    # Voxels of each galaxy
-        self.subpops = {}   # Create samples based on sigma-cuts
-        self.vols = {}      # volumes of the sigma cuts
-        self.smfs = {}      # smf information stored as [[m1, N1, n1, n_error1], ...] for each value
-        self.fits = {}      # Fits to the smfs. Data is stored depending on type of fit (see self.fit_SMF)
-        
+        self.voxels = []  # Voxels of each galaxy
+        self.ODs =  []  # Overdensity values
+        self.n_sigmas = []  # Sigma above mean overdensity
+        self.pks =  {}  # Peak number dictionary
+        self.subpops = {}  # Create samples based on sigma-cuts
+        self.vols = {}  # Volumes of the sigma cuts
+        self.smfs = {}  # SMF information stored as [[m1, N1, n1, n_error1], ...] for each value
+        self.fits = {}  # Fits to the SMFs. Data is stored depending on type of fit
+
+        ## Check uniqueness
+        if len(np.unique(IDs)) != len(IDs):
+            raise ValueError("Non-unique IDs provided. The IDs input must be an array of unique identifiers.")
+
+        if self.verbose:
+            print(f"Initialized GalPop object with {len(self.IDs)} galaxies.")
+
+    # ====================================================================
+    # ====================================================================
     # ====================================================================
 
 
-    def addMag(self, mag_name : str, mag_vals : list[float]) -> None:
+
+    def assign_peaks(self, sigs : Iterable[float], sig_summary_files : Iterable[str],
+                     sig_data_folders : Iterable[str], overwrite : bool = False) -> None:
         """
-        Add an array of magnitudes for the galaxy population. Adds to self.mags as {mag_name : mag_vals}
+        Assign galaxies to a peak number given a set of find_peaks outputs. This updates the self.pks dictionary with keys given
+        by the sigs input.
 
-        INPUTS:
-            - mag_name  (str)   = Name of the band. Referenced in functions for mag-cuts
-            - mag_vals  (array) = array of
-        """
-        if self.verbose: print(f"Updating self.mags with new band: {mag_name}")
-        self.mags[mag_name] = mag_vals
+        Parameters
+        -----------
+        sigs : Iterable[float]
+            List of sigma values used to defined peaks in the find_peaks outputs. These are used as the keys in self.pks
+            - Example: [2, 2.5, 3] would assign every galaxy to peaks defined with thresholds 2, 2.5, and 3 sigma. self.pks
+                would then be populated with lists corresponding to the keys 2, 2.5, and 3
 
-
-
-    # ====================================================================
-
-    def assignPeaks(self, sigs, sig_cube, sig_summary_files, sig_data_folders, overwrite=False):
-        """
-        Assign galaxies to overdensity peaks.
-
-        Parameters:
-            sigs (list): List of sigma thresholds.
-            sig_summary_files (list): List of summary files for each sigma threshold.
-            sig_data_folders (list): List of directories containing peak voxel data files for each sigma.
-            overwrite (bool): Whether to overwrite existing assignments in self.pks.
-        """
-        if not overwrite and self.pks:
-            raise ValueError("Peak assignments already exist. Use overwrite=True to reassign.")
+        sig_summary_files : Iterable[str]
+            Paths to the find_peaks summary files corresponding to each sigma-value in sigs.
         
-        if len(self.n_sigmas) == 0:  # Assign each galaxy to a voxel if needed
-            self.update_n_sigmas(sig_cube)
+        sig_data_folders : Iterable[str]
+            Paths to the folders containing individual peak informaiton for each sigma-value
+        
+        overwrite : bool, optional
+            If True, will overwrite the contents of self.pks for the given keys in sigs. This method can take sometime, so this is
+            purely to avoid accidental deletion of peak information.
+
+        Notes
+        -----
+        - The method uses spatial KDTree lookups and voxel data to efficiently assign galaxies to peaks.
+        - Peak assignment relies on summary files, voxel data, and bounds for each peak.
+        - Requires `self.update_n_sigmas()` to be run beforehand to ensure galaxy overdensity data is up to date.
+        """
+
+        ## Check existance of sigmas and verify overwrite
+        existing_sigmas = [s for s in sigs if s in self.pks ]
+
+        if existing_sigmas and not overwrite:
+            existing_str = ", ".join(map(str, existing_sigmas))
+            raise ValueError(
+                f"Peak assignments already exist for sigma = {existing_str}. "
+                f"Use `overwrite=True` to reassign.")
+
+        ## Make sure n-sigmas have been defined
+        if len(self.n_sigmas) == 0:  
+            raise ValueError("Missing galaxy overdensity information. Run self.update_n_sigmas() first, then re-run.")
 
 
-        # Initialize pks for each sigma
-        self.pks = {sig: [-99] * len(self.voxels) for sig in sigs}
-
-        # Process each sigma level
+        ## Process each sigma level
         for sig, summary_file, data_folder in zip(sigs, sig_summary_files, sig_data_folders):
+
+            # Fill the pk-info with filler data
+            self.pks[sig] = [-99] * len(self.voxels)
+
             # Load the peak summary file
             pk_sum = np.genfromtxt(summary_file, comments="#")
             
@@ -146,705 +203,212 @@ class GalPop:
                             assignments[voxel_idx] = peak_id
                             break
 
-            self.pks[sig] = assignments
+            self.pks[sig] = np.array(assignments)
 
 
-
-
-    def makeField(self, field_name, pk_def, pk_path, pk_sum, pk_folder, cosmo = None, gal_sample = None ):
-        """
-        Used for defining a field population out of some sample of galaxies based on some definition of 'peaks'
-
-        INPUTS:
-            - field_name    = Key name to be stored in self.subpops
-            - pk_def    = [minimum peak sigma, necessary sig to define peak, min peak mass]
-            - cosmo = Cosmology to use for volume (Default to FlatLambdaCDM(H0=70, Om0=0.27))
-            - gal_sample = sub-sample of galaxies to use
-        """
-
-        if cosmo == None: cosmo = FlatLambdaCDM(H0 = 0.70, Om0=0.27)
-
-        pk_sum = np.genfromtxt(pk_path + pk_sum, dtype=float, skip_header=0)    # Peak summary file
-
-
-        pks = np.unique(self.pks[pk_def[0]][gal_sample])
-        pks = pks[pks >= 0]
-
-        b_pks = []
-
-        for p in pk_sum:
-            if p[11] >= pk_def[2]:   # massive enough
-                
-                try:    # If non-single-digit peak (e.g., 10, 25, 102, etc)
-                    p_data = np.genfromtxt(pk_path+pk_folder+"\\"+f"pixels_{int(p[0])}.dat", comments = '#')
-                except: # If single digit peak (e.g., 1, 2, 3, etc)
-                    p_data = np.genfromtxt(pk_path+pk_folder+"\\"+f"pixels_0{int(p[0])}.dat", comments = '#')
-                
-                if np.max(p_data[:,3]) >= pk_def[1]:        # Overdense enough
-                    if np.isin(p[0], pks):      # At least one galaxy in the peak
-                        b_pks.append(int(p[0]))
-        
-        sp = np.logical_and(np.isin(self.pks[pk_def[0]], b_pks, invert=True), np.isin(list( range(len(self.IDs))), gal_sample))
-
-        bad_vol = np.sum(pk_sum[:,10][b_pks])
-
-        lz, hz = np.min(self.coords[:,2][sp]), np.max(self.coords[:,2][sp])
-
-        theta_dec = np.abs(np.max(self.coords[sp][:,1])-np.min(self.coords[sp][:,1]))*np.pi/180 
-        theta_RA  = np.abs(np.max(self.coords[sp][:,0])-np.min(self.coords[sp][:,0]))*np.pi/180  * np.cos(theta_dec)
-        Omega     = theta_RA * theta_dec # get rid of unit
-        V_cube  = Omega/(4*np.pi) *(cosmo.comoving_volume(hz) - cosmo.comoving_volume(lz))
-        Vol = V_cube.value - bad_vol
-
-
-        self.subpops[field_name] = sp
-        self.vols[field_name] = Vol
-
-
-
-
-    def subPop(self, key_name, sig_range, min_mass, z_range, pk_path, pk_sum, sig_cube, pk_nums = [], pk_folder='None', cosmo = None, plot="None", gal_sample=None):
-        """
-        INPUTS:
-            - key_name (str/float)  = key for self.subpops dictionary and self.vols dictionary where info from this is stored
-            - sig_range  (array) = Define the range of overdensities to test [sig_min , sig_max). Note if sig_min != -99 or
-                - sig_max != np.inf, they should correspond to a key in the self.pks dict set via self.assignPeaks
-                - If sig_max == np.inf, report all galaxies above sig_min. 
-                - If field (i.e. pk_folder != 'None'), sig_min defines potential protostuctures and sig_max confirms a protostructure
-            - min_mass (float)  =  Mass-cutoff for peaks
-            - z_range    (array) = Define the redshift range to look at [z_min, z_max]
-            - pk_path (str)    - The path to the directory containing all of the find_peaks information 
-                        (i.e. summary files and peak-folders)
-            - pk_sum (str)    - File containing the peak summary data from find_peaks
-            - sig_cube (.fits)  - The fits file containing the sigma-cube from find_peaks
-            - pk_nums (list)    = List of the peak numbers to test for (note not the peak index, but peak number)
-                    - If [], it tests all peaks
-            - pk_folder (str)   - Path the folder containing peak info related to the pk_sum (only needed for field)
-            - cosmo (astropy cosmology) = Cosmology to calculate field volume if applicable
-            - plot (str)    - Plotting option -- Plots via helper method
-                - "None" = No plots
-                - "show" = Show the plot in the terminal
-                - directory = If you want to save, put the directory name to save to here
-        """
-        # Check if relevant peak information has been found
-        if (sig_range[1] not in self.pks) and (sig_range[1] != np.inf):
-                print(f"self.pks has no key {sig_range[1]}. Run self.assignPeaks with this key")
-                return
-        
-        if (len(self.n_sigmas) == 0) or (np.all(np.isnan(self.n_sigmas))):   # Update n-sigmas if needed
-            self.update_n_sigmas(sig_cube)
-
-        if self.verbose:
-            print(f"Finding the subpopulation in the peak {key_name}")
-
-        pk_sum = np.genfromtxt(pk_path + pk_sum, dtype=float, skip_header=0)    # Peak summary file
-        
-        ## Find interpolated position of each peak barycenter
-        bRAs = np.interp(x = pk_sum[:,4], xp = np.arange(np.shape(sig_cube[1])[0]), fp = sig_cube[1].data)
-        bdecs = np.interp(x = pk_sum[:,5], xp = np.arange(np.shape(sig_cube[2])[0]), fp = sig_cube[2].data)
-        bzs = np.interp(x = pk_sum[:,6], xp = np.arange(np.shape(sig_cube[3])[0]), fp = sig_cube[3].data)
-
-        b_coords = np.c_[bRAs, np.c_[bdecs, bzs]]   # Pack peak coordinates into array
-
-        ## Make cut on relevant peaks based on mass, redshift, and specified pk numbers
-        if len(pk_nums) == 0: pk_nums = pk_sum[:,0]     # If no pks specified, assume all are ok
-
-        g_idxs = np.where((b_coords[:,2] >= z_range[0]) & (b_coords[:,2] <= z_range[1])  # redshifts
-                    & (pk_sum[:,11] >= min_mass)                 # Masses
-                    & (np.isin(pk_sum[:,0], pk_nums))  )    # Make sure the peak number is one that is wanted
-
-        g_pks = pk_sum[g_idxs]      # List of relevant peak information
-        g_coords = b_coords[g_idxs] # list of barycenter coordinates of relevant peaks
-
-
-        ### DEFINE GAL SAMPLE IN SIGMA-RANGE
-
-        ## FIELD (no lower limit)
-        if pk_folder != 'None': 
-
-            bad_Vol = 0  # Volume of potential structures in field
-            test_idxs = np.where((self.coords[:,2] >= z_range[0]) & (self.coords[:,2] <= z_range[1]) )[0] # Gals in redshift range
-
-            # Loop through each peak, find max mass, and remove gals from field if they're in a protostructure
-            for pk in g_pks:
-                pk_gal_idxs = np.where((self.coords[:,2] >= z_range[0]) & (self.coords[:,2] <= z_range[1])    # In relevant redshift
-                            & (self.pks[sig_range[0]] == pk[0]) )[0]   
-                
-                # If max n-sigma is greater than max sigma entered, remove all these galaxies from the field
-                if len(pk_gal_idxs) != 0:
-                    try:    # If non-single-digit peak (e.g., 10, 25, 102, etc)
-                        p_data = np.genfromtxt(pk_path+pk_folder+"\\"+f"pixels_{int(pk[0])}.dat", comments = '#')
-                    except: # If single digit peak (e.g., 1, 2, 3, etc)
-                        p_data = np.genfromtxt(pk_path+pk_folder+"\\"+f"pixels_0{int(pk[0])}.dat", comments = '#')
-
-                    if np.max(p_data[:,3]) >= sig_range[1]:
-                        bad_Vol += pk[10]   # Add volume of peak to bad volume
-                        # Remove all the indices from the list of good indices
-                        bad_ids = np.in1d(test_idxs, pk_gal_idxs)
-                        test_idxs = np.delete(test_idxs, bad_ids)
-        
-        ## UPPER BOUND PROVIDED (finite sigma-interval)
-        elif sig_range[1] != np.inf: 
-            mask = np.in1d(self.pks[sig_range[0]], g_pks[:,0])   # Make mask for if peak number is in relevant peak
-            test_idxs = np.where((self.coords[:,2] >= z_range[0]) & (self.coords[:,2] <= z_range[1])    # In relevant redshift
-                            & (self.n_sigmas >= sig_range[0]) & (self.n_sigmas < sig_range[1]) # In relevant overdensity regime
-                            & mask & gal_sample )[0]    # In relevant peak
-            
-        ## NO UPPER BOUND (half-open sigma-interval)
-        else:   
-            mask = np.in1d(self.pks[sig_range[0]], g_pks[:,0])   # Make mask for if peak number is in relevant peak
-
-            test_idxs = np.where((self.coords[:,2] >= z_range[0]) & (self.coords[:,2] <= z_range[1])    # In relevant redshift
-                            & (self.n_sigmas >= sig_range[0])   # In relevant overdensity
-                            & mask & gal_sample)[0]    # In relevant peak
-            
-        ### SAVE SAMPLE
-        self.subpops[key_name] = np.isin(range(len(self.IDs)), test_idxs )   # Saves the bools for which indices are in the subpop
-
-        ### FIND VOLUMES
-
-        ## Not the field
-        if pk_folder == 'None':
-            rel_sig = int(not(sig_range[1] == np.inf))  # 0 if upper limit is inf, 1 otherwise
-
-            unique_peaks = np.unique(self.pks[sig_range[rel_sig]][test_idxs]) # Find peak numbers that have a galaxy in them
-            Vol = np.sum(pk_sum[np.argmin(np.abs(unique_peaks[:,np.newaxis] - pk_sum[:,0]), axis=1)][:,10])     # sum the volumes of the peaks
-
-
-
-        ## Field sample
-        else:
-            if cosmo == None: 
-                print("Unable to calculate Volume due to missing Cosmology")
-                return
-            ## Subtract volume of protostructures from the cube
-            test_idxs = np.where((self.coords[:,2] >= z_range[0]) & (self.coords[:,2] <= z_range[1]) )[0] # Gals in redshift range
-            print(test_idxs)
-            theta_dec = np.abs(np.max(self.coords[test_idxs][:,1])-np.min(self.coords[test_idxs][:,1]))*np.pi/180 
-            theta_RA  = np.abs(np.max(self.coords[test_idxs][:,0])-np.min(self.coords[test_idxs][:,0]))*np.pi/180  * np.cos(theta_dec)
-            Omega     = theta_RA * theta_dec # get rid of unit
-            V_cube  = Omega/(4*np.pi) *(cosmo.comoving_volume(z_range[1]) - cosmo.comoving_volume(z_range[0]))
-            Vol = V_cube.value - bad_Vol
-
-
-        self.vols[key_name] = Vol
-
-        ## Plot results
-        if plot != "None":
-            good_gals = self.coords[test_idxs]     # Trim down to galaxies which may be in a peak
-            g_gal_otype = self.obs_type[test_idxs]
-            bad_gals = np.delete(self.coords, test_idxs, axis=0)   # Galaxies which aren't used.
-            bad_gals = bad_gals[np.where((bad_gals[:,2] >= z_range[0]) & (bad_gals[:,2] <= z_range[1]))]    # In relevant redshift
-
-            ## Find plot peaks
-            rel_sig = int(not(sig_range[1] == np.inf))
-            unique_peaks = np.unique(self.pks[sig_range[rel_sig]][test_idxs]) # Find peak numbers that have a galaxy in them
-            p_ids = np.in1d(g_pks[:,0], unique_peaks)
-
-
-            self.subPop_plot(key_name, sig_range, z_range, g_coords[p_ids], g_pks[p_ids], good_gals, bad_gals, g_gal_otype, plot)
-
-
+    # ====================================================================
+    # ====================================================================
     # ====================================================================
 
 
 
-    def subPop_plot(self, key_name, sig_range, z_range, g_coords, g_pks, good_gals, bad_gals, otype, plot):
-        """
-        Helper method for plotting data from the subPop
-        """
-        ra_range = [np.min(self.coords[:,0]), np.max(self.coords[:,0])]
-        dec_range = [np.min(self.coords[:,1]), np.max(self.coords[:,1])]
-        # ra_range = (149.5, 150.6)  
-        # dec_range = (1.7, 2.8)
 
+    def make_subpop(self, 
+            subpop_name: str,  field : bool, pk_def: Iterable[float, float, float],
+            sig_summary_file: str, sig_data_folder: str, 
+            *,
+            boundaries: Iterable[Iterable[float]] = None,
+            cosmo: astropy.cosmology = None, 
+            gal_sample: Iterable[bool] = None):
+        """
+        Create a subpopulation of galaxies based on peak inclusion or exclusion criteria.
 
-        style_dict = {          # Dictionary of all the styles
-            12: ['*', 'gold', "[12,12.5)"], 12.5: ['h', 'deepskyblue', "[12.5,13)"], 13: ['o', 'royalblue', "[13,13.5)"],
-            13.5: ['X', 'forestgreen', "[13.5,14)"], 14 :['>', 'darkorange', "[14,14.5)"], 14.5 : ['s', 'red', "[14.5,15)"], 
-            15 :['D', 'maroon', r"M $\geq15$"]  }
+        Parameters
+        ----------
+        subpop_name : str
+            The name of the subpopulation. This will be the key in self.subpops and self.vols.
+
+        field : bool
+            Specify whether this is a field sample (i.e. peaks are excluded) or a structure sample (i.e. peaks are included)
+
+        pk_def : Iterable[float, float, float]
+            Array defining the peaks ([sigma_def, req_sig, min_mass]):
+            - sigma_def = Sigma threshold defining peak (should be a key in self.pks).
+            - req_sig = Sigma requirement for a peak to be considered valid.
+            - min_mass = Minimum mass requirement [log(M)] for a peak to be valid.
+
+        sig_summary_file : str
+            Path to the relevant summary file from `find_peaks.py`.
+
+        sig_data_folder : str
+            Path to the folder containing peak information from `find_peaks.py`.
+
+        Optional Parameters
+        -------------------
+        boundaries : Iterable[Iterable[float]], optional
+            Boundaries for the volume calculation ([RA_min, RA_max], [Dec_min, Dec_max], [z_min, z_max]).
+
+        cosmo : astropy.cosmology, optional
+            Cosmology for volume calculations. Defaults to FlatLambdaCDM(H0=70.0, Om0=0.27).
+
+        gal_sample : Iterable[bool], optional
+            Array specifying which galaxies to consider. Defaults to all galaxies.
+        """
+        ## Validate inputs
+        cosmo = cosmo or FlatLambdaCDM(H0=70.0, Om0=0.27)
+
+        if gal_sample is None:
+            gal_sample = np.arange(len(self.IDs))
+
+        sigma_def = pk_def[0]
+        if sigma_def not in self.pks:
+            raise ValueError(f"Sigma = {sigma_def} not found in self.pks. Run self.assign_peaks with this sigma.")
         
-        ## Set up gridspec plot
-        fig = plt.figure(figsize=(14,10))
-        gs = gridspec.GridSpec(2, 1, wspace=0)
 
-        # Row 1 -- plotting peak locations
-        row = gs[0].subgridspec(1,2, width_ratios=[1,1.5])
-        ax00, ax01 = fig.add_subplot(row[0]), fig.add_subplot(row[1], projection='3d')
+        ## Initialize subpopulation mask
+        subpop_mask = np.full(len(self.IDs), False)
+        subpop_mask[gal_sample] = True
 
-        round_ms = np.array([min(15,m//0.5/2) for m in g_pks[:,11]])   # Rounded masses that dictate the plotting style
+        # Identify peaks to include or exclude
+        peaks, peak_vol = self._identify_peaks(pk_def, sig_summary_file, sig_data_folder, gal_sample)
 
-        for k in list(style_dict.keys()):
-            peaks = np.where(k == round_ms)[0]      # Find which peaks are in the given mass-bin
+        # Update subpopulation mask
+        subpop_mask = np.logical_and(subpop_mask, ~np.isin(self.pks[sigma_def], peaks) if field  else np.isin(self.pks[sigma_def], peaks))
 
-            if len(peaks) != 0: # If there are some peaks in the mass-bin:
+        # Calculate volume
+        volume = self._calculate_volume(boundaries, gal_sample, cosmo, peak_vol) if field else peak_vol
 
-                # 2D plot
-                ax00.scatter(g_coords[peaks][:,0], g_coords[peaks][:,1], marker=style_dict[k][0],
-                            c=style_dict[k][1], s=100, label=style_dict[k][2])  
-                # 3D plot
-                ax01.scatter(g_coords[peaks][:,2], g_coords[peaks][:,0], g_coords[peaks][:,1],
-                    marker=style_dict[k][0], c=style_dict[k][1], s=100, label=style_dict[k][2])
-                
-        # Clean up plots after all points are plotted
-        ax00.set(xlim=ra_range, ylim=dec_range, xlabel="RA (deg)", ylabel="Dec (deg)")
-        ax00.xaxis.label.set_fontsize(15)
-        ax00.yaxis.label.set_fontsize(15)
-        for axis in ax00.get_xticklabels() + ax00.get_yticklabels(): axis.set_fontsize(12)
-      
-        ax00.legend(title = r"$\log_{10}(M_*)\in$", title_fontsize=12)
-        ax00.invert_xaxis()
-        ax01.set(xlim=z_range, ylim=ra_range, zlim=dec_range, xlabel="Redshift", ylabel="RA (deg)", zlabel="Dec (deg)")
-        ax01.set_xticks(np.arange(z_range[0], z_range[1], 0.05))
-        ax01.xaxis.label.set_fontsize(15)
-        ax01.yaxis.label.set_fontsize(15)
-        ax01.zaxis.label.set_fontsize(15)
-        for axis in ax01.get_xticklabels() + ax01.get_yticklabels() + ax01.get_zticklabels(): axis.set_fontsize(12)
-        ax01.legend(title = r"$\log_{10}(M_*)\in$", title_fontsize=12)
-        ax01.set_box_aspect((5,5,3), zoom=1.2)
-        ax01.view_init(25)
-        ax01.invert_yaxis()
-        ax01.invert_xaxis()
-
-        # Row 2 -- Plotting good vs bad galaxies
-        row = gs[1].subgridspec(1,2, width_ratios=[1,1.5])
-        ax10, ax11 = fig.add_subplot(row[0]), fig.add_subplot(row[1], projection='3d')
-
-        # 2D
-        ots = [0,1,2]
-        ot_cs = ['tab:blue', 'tab:orange', 'tab:green']
-        ot_label = ['COSMOS2020', 'Spectroscopy', 'HST Grism']
-        s_gals = 40
-        # Field:
-        if sig_range[0] == -99: 
-            ot_cs = ['tab:green', 'tab:green', 'tab:green']
-            s_gals = 20
-            ax10.scatter(good_gals[:,0], good_gals[:,1], marker='.', c='g', alpha=0.15) # Usable galaxies
-            ax10.scatter(bad_gals[:,0], bad_gals[:,1], marker='.', c='r', label=f"{len(bad_gals)} Excluded Galaxies") # Unusable galaxies
-        else:
-            ax10.scatter(bad_gals[:,0], bad_gals[:,1], marker='.', c='r', alpha=0.15, label=f"{len(bad_gals)} Excluded Galaxies") # Unusable galaxies
-            for idx in range(len(ots)):
-                plot_ids = np.where(otype==ots[idx])
-                if len(plot_ids[0])>0:
-                    plt_coords = good_gals[plot_ids]
-                    ax10.scatter(plt_coords[:,0], plt_coords[:,1], marker='.', s=s_gals, 
-                                c=ot_cs[idx], label=f"{ot_label[idx]} : {len(plot_ids[0])}")
-
-        # 3D
-        for idx in range(len(ots)):
-            plot_ids = np.where(otype==ots[idx])
-            if len(plot_ids[0])>0:
-                plt_coords = good_gals[plot_ids]
-                ax11.scatter(plt_coords[:,2], plt_coords[:,0], plt_coords[:,1], marker='.', s=s_gals,
-                            c=ot_cs[idx], label=f"{ot_label[idx]} : {len(plot_ids[0])}")
-
-        # Clean up plots
-        ax10.set(xlim=ra_range, ylim=dec_range, xlabel="RA (deg)", ylabel="Dec (deg)")
-        ax10.xaxis.label.set_fontsize(15)
-        ax10.yaxis.label.set_fontsize(15)
-        for axis in ax10.get_xticklabels() + ax10.get_yticklabels(): axis.set_fontsize(12)
-        ax10.invert_xaxis()
-        ax10.legend()
-        ax11.set(xlim=z_range, ylim=ra_range, zlim=dec_range, xlabel="Redshift", ylabel="RA (deg)", zlabel="Dec (deg)")
-        ax11.set_xticks(np.arange(z_range[0], z_range[1], 0.05))
-        ax11.xaxis.label.set_fontsize(15)
-        ax11.yaxis.label.set_fontsize(15)
-        ax11.zaxis.label.set_fontsize(15)
-        for axis in ax11.get_xticklabels() + ax11.get_yticklabels() + ax11.get_zticklabels(): axis.set_fontsize(12)
-        ax11.set_box_aspect((5,5,3), zoom=1.2)
-        ax11.view_init(25)
-        ax11.legend(title="Source of Redshift", title_fontsize=12, loc= 'upper right')
-
-        ax11.invert_yaxis()
-        ax11.invert_xaxis()
-    
-
-        # Show/save plots
-        if plot in ("show", "Show"): plt.show()
-        else:
-            if sig_range[1] >0:
-                if sig_range[0]==-99:
-                    try: plt.savefig(plot + f"\Sigma_{sig_range[0]}_{sig_range[1]}_plot{key_name}.png")
-                    except:
-                        try:
-                            os.mkdir(plot)
-                            plt.savefig(plot + f"\Sigma_{sig_range[0]}_{sig_range[1]}_plot{key_name}.png")
-                        except: print("Unable to make plot")
-
-                else:
-                    try: plt.savefig(plot + f"\Sigma_{sig_range[0]}_{sig_range[1]}_plot.png")
-                    except:
-                        try:
-                            os.mkdir(plot)
-                            plt.savefig(plot + f"\Sigma_{sig_range[0]}_{sig_range[1]}_plot.png")
-                        except: print("Unable to make plot")
-            else:
-                try: plt.savefig(plot + f"\Sigma_{sig_range[0]}_plot.png")
-                except:
-                    try:
-                        os.mkdir(plot)
-                        plt.savefig(plot + f"\Sigma_{sig_range[0]}_plot.png")
-                    except: print("Unable to make plot")
-        plt.close()
-
-    # ====================================================================
-
-    def make_SMF(self, subPop_keys, smf_keys ,m_range):
-        """
-        Generates SMFs based on the key-names associated with different subpops. 
-
-        INPUTS:
-            - subPop_keys (array) =  keys for self.subpops dictionary. These are the sub pops which will have an SMF generated for them
-                - NOTE: each element of this array can be either a single key, or a list of keys if combining subPops for one SMF
-            - smf_keys  (array) = key names in the self.smfs dictionary to store the smf info
-                - NOTE: Info is stored as an array of [[m, N, n, n_error], ...] for each key.
-            - m_range (array) = mass-range to generate the SMF for
-                - [min_mass, max_mass, m_step]
-        """
-        for sk, k in zip(subPop_keys, smf_keys):
-
-            # If combining multiple subpops for one SMF, combine those
-            if self.isIt(sk):
-                masses = self.ms[self.subpops[sk[0]]]   # initialize list of masses
-                sfrs = self.SFRs[self.subpops[sk[0]]]   # initialize list of masses
-                vol = self.vols[sk[0]]      # initialize volume
-                for sk_sub in sk[1:]:   # loop through remaining keys and combine masses and volume
-                    masses = np.concatenate((masses, self.ms[self.subpops[sk_sub]] ))
-                    sfrs = np.concatenate((sfrs, self.SFRs[self.subpops[sk_sub]] ))
-                    vol += self.vols[sk_sub]
-
-            else:   # if just looking at one key
-                masses = self.ms[self.subpops[sk]] 
-                sfrs = self.SFRs[self.subpops[sk]] 
-                vol = self.vols[sk]
-
-            smf_info = []       # Store smf info for this key as [[m, N, n, n_err], ...]
-            mass = m_range[0]   # keep track of mass
-
-            while mass <= m_range[1]:
-                smf_mbin = []   # [m, N, n, n_error] for this mass bin
-
-                # Find galaxies in the mass bin
-                gals = np.where( (masses >= mass) & (masses < mass + m_range[2]) )[0]
-
-                if len(gals) != 0:  # If there are galaxies in the mass bin
-                    smf_mbin.append(np.median(masses[gals]))  # mass
-                    smf_mbin.append(len(gals))                  # N
-                    smf_mbin.append(len(gals) / vol / m_range[2])  # n
-                    smf_mbin.append(np.sqrt(len(gals)) / len(gals) / vol / m_range[2])  # n_error
-                    smf_mbin.append(np.median(sfrs[gals] / 10**masses[gals]))
-                else:   # No galaxies in the mass bin
-                    smf_mbin.append(mass)       
-                    smf_mbin.append(0)
-                    smf_mbin.append(0)
-                    smf_mbin.append(np.nan)
-                    smf_mbin.append(np.nan)
-
-                mass += m_range[2]  # Step up to new mass bin
-                smf_info.append(smf_mbin)
-
-            self.smfs[k] = np.array(smf_info)     # Add the info for the current key
-
+        # Store results
+        self.subpops[subpop_name] = subpop_mask
+        self.vols[subpop_name] = volume
 
     # ====================================================================
 
 
-    def SMF_plot(self, smf_keys, smf_labels, fit_keys, fit_labels, title="", plot=""):
+    def _identify_peaks(self, pk_def: Iterable[float, float, float], 
+                        sig_summary_file: str, sig_data_folder: str, 
+                        gal_sample: Iterable[int]):
         """
-        Plot different SMFs together
+        Helper function for self.make_subpop()\n
+        Identify peaks to include or exclude and calculate associated volume.
+        """
+        sigma_def, req_sig, min_mass = pk_def
+        peak_summary = np.genfromtxt(sig_summary_file, dtype=float, skip_header=0)
 
-        INPUTS:
-            - smf_keys (array)  = Keys in self.smfs to plot
-            - smf_labels    (array) = Plot labels for the smf_keys
-            - fit_keys  (array) = Keys in self.fits to plot
-            - fit_labels    (array) = Plot labels for the fit_keys
-            - title (str)   = Title of the plot. If '', title it "SMF"
-            - plot (str)    = Path to save the string at. If '', then it shows the plot.
-        """
-        colors = ['tab:purple', 'tab:blue','tab:green', 'tab:orange', 'tab:red']  
-        shapes = ["o", "H", "s", "D", (5,1,0)]
-        min_m, max_m = 99, -99  # For plot limits
-        if len(smf_keys) > 0:
-            for i, k in enumerate(smf_keys):
+        # Find peaks with galaxies assigned to them
+        peaks = np.unique(self.pks[sigma_def][gal_sample])
+        peaks = peaks[peaks >= 0]
+
+        valid_peaks = []
+        total_volume = 0
+
+        for peak_id in peaks:
+            if peak_summary[peak_id - 1, 11] >= min_mass:  # Check mass of the peak
                 try:
-                    plt.errorbar(self.smfs[k][:,0], self.smfs[k][:,2], self.smfs[k][:,3], 
-                                label=smf_labels[i], marker=shapes[i], color=colors[i], ls='')
-                    min_m = np.min(min_m, min(self.smfs[k][:,0]))
-                    max_m = np.max(max_m, max(self.smfs[k][:,0]))
-                except: pass
-                # except: print(f"The key {k} is not in self.smfs. Generate the smf and run again")
-            # Fix up mass limits
-            min_m = 9.5 if min_m==99 else min_m-0.2
-            max_m = 12 if max_m==-99 else max_m+0.5
-        if len(fit_keys) > 0:
-            for i, k in enumerate(fit_keys):
-                try:    
-                    params = self.fits[k]
-                except: print(f"The key {k} is not in self.fits. Generate the fit and run again")
-                m_vals = np.linspace(min_m, max_m, 1000)
+                    voxel_data = np.genfromtxt(f"{sig_data_folder}/pixels_{int(peak_id):02d}.dat", comments="#")
+                except FileNotFoundError:
+                    continue
 
-                if len(params) == 3:    # Single Schechter fit
-                    plt.plot(m_vals, self.schechter(m_vals, params[0], params[1], params[2]), color=colors[i], marker='', label=fit_labels[i])
-                else:    # Double Schechter fit
-                    plt.plot(m_vals, self.Dschechter(m_vals, *params), color=colors[i], marker='', label=fit_labels[i])
-        
-        
-        plt.yscale("log")
-        plt.ylim(10**-6, 10**-1)
-        if (len(smf_keys)==0) or (len(fit_keys)==0): plt.legend(loc='lower left')
-        else: plt.legend(loc='lower left', ncol=2)
-        if title=="": plt.title("SMF") 
-        else: plt.title(title)
-        plt.ylabel(r"$\rm \phi \quad [N\, cMpc^{-3}\,dex^{-1}]$", fontsize=15)
-        plt.xlabel(r"$\rm \log_{10}(M_*/M_\odot)$", fontsize=15)    
-        plt.xlim(min_m, max_m)
+                if np.max(voxel_data[:, 3]) >= req_sig:  # Check sigma requirement
+                    valid_peaks.append(peak_id)
+                    total_volume += peak_summary[peak_id - 1, 10]
 
-        if plot != "":
-            try:
-                plt.savefig(plot)
-            except:
-                os.mkdir(plot)
-                plt.savefig(plot)
-        else:
-            plt.show()
-
-
-    # ====================================================================
-
-    def SMF_relPlot(self, base_key, base_label, smf_keys, smf_labels, title="", plot=""):
-        """
-        Plot SMFs relative to a single one (i.e. the ratio of the smfs to the base-smf)
-
-        INPUTS:
-            - base_key (key)    = Key in self.smfs to use as the normalizing smf
-            - base_label (str)  = label for the base smf in the y_axis (i.e. \phi_{base_label})
-            - smf_keys (array)  = Keys in self.smfs to plot normalized by the base-smf
-            - smf_labels    (array) = Plot labels for the smf_keys
-            - title (str)   = Title of the plot. If '', title it "SMF"
-            - plot (str)    = Path to save the string at. If '', then it shows the plot.
-        """
-        colors = ['tab:purple', 'tab:blue','tab:green', 'tab:orange', 'tab:red']  
-        shapes = ["o", "H", "P", "s", "D", (5,1,0)]
-        min_m, max_m = 99, -99  # For plot limits
-        min_n, max_n = 0.2, 1
-        try:
-            norms = self.smfs[base_key][:,2]
-        except:
-            print(f"The key {base_key} is not in self.smfs. Generate the smf and run again")
-            return
-        
-        for idx, k in enumerate(smf_keys):
-            try:
-                data = self.smfs[k]
-                # Set length of normalizing array
-                if len(norms) > len(data): 
-                    norms = norms[:len(data)]   # Shorten normalizing array
-                else:   # Shorten data
-                    data = data[:len(norms)]
-                plt.errorbar(data[:,0], data[:,2] / norms, data[:,3], 
-                                label=smf_labels[idx], marker=shapes[idx], color=colors[idx])
-                
-                min_m = min(min_m, min(data[:,0]))
-                max_m = max(max_m, max(data[:,0]))
-                min_n = min(min_n, min(data[:,2]/norms))
-                max_n = max(max_n, max(data[:,2]/norms))
-            except: print(f"The key {k} is not in self.smfs. Generate the smf and run again")
-
-
-
-        plt.legend(loc='lower left')
-        if title=="": plt.title("SMF") 
-        else: plt.title(title)
-        plt.ylabel(rf"$\rm \phi/\phi_{base_label}$", fontsize=15)
-        plt.xlabel(r"$\rm \log_{10}(M_*/M_\odot)$", fontsize=15)    
-        plt.xlim(min_m, max_m)
-        plt.ylim(min_n-0.2, max_n+ 0.5)
-
-        if plot != "":
-            try:
-                plt.savefig(plot)
-            except:
-                os.mkdir(plot)
-                plt.savefig(plot)
-        else:
-            plt.show()
-
-    # ====================================================================
-
-
-    def fit_SMF(self, smf_keys, fit_keys, N_schechters, **kwargs):
-        """
-        Fits either a single or double schechter function to a given SMF. Fits are done with scipy.optimize.curve_fit
-
-
-        INPUTS:
-            - smf_key (array)   = Key names for SMF in self.smfs to fit (see self.make_SMF)
-            - fit_key (array)   = Key names for this fit in the self.fits dict. The fit is stored as:
-                - 1 (single)      --> [M_star, phi_star, alpha]
-                - 2 (double)      --> [M_star, phi_s1, phi_s2, alpha_1, alpha_2]
-            - N_schechter (array) = Either 1 (single) or 2 (double) schechter.
-            - **kwargs         = Optional variables for curve_fit
-        """
-        for s_key, f_key, Ns in zip(smf_keys, fit_keys, N_schechters):
-            
-            # Find valid data points in the SMFs
-            g_idxs = np.where(np.isnan(self.smfs[s_key][:,2]) == False)
-            smf_data =  self.smfs[s_key][g_idxs]
-            
-            if Ns == 1: fit_fn = self.schechter
-            elif Ns == 2:  fit_fn = self.Dschechter
-            else:   
-                print("Elements of N_schechter must be either 1 or 2")
-                return
-
-            f_params, f_err = curve_fit(fit_fn, smf_data[:,0], smf_data[:,2], sigma=smf_data[:,3], **kwargs)
-            self.fits[f_key] = f_params
-
-
-
-
-
+        return (valid_peaks, total_volume)
     
-    def schechter(self, M, M_star, phi_star, alpha):
-        """
-        Single-Schecter Function
-        """
-        return np.log(10)*phi_star*10**((M-M_star)*(1+alpha))*np.exp(-10**(M-M_star))
-    
-    def Dschechter(self, M, M_star, phi_s1, phi_s2, alpha_1, alpha_2):
-        """
-        Double-Schechter function
-        """
-        return np.log(10)*np.exp(-10**(M-M_star))*(phi_s1*(10**(M-M_star))**(alpha_1+1) \
-        +phi_s2*(10**(M-M_star))**(alpha_2+1) )
+    # ====================================================================
 
+
+    def _calculate_volume(self, boundaries: Iterable[Iterable[Iterable[float]]], gal_sample: Iterable[int], cosmo: astropy.cosmology, bad_volume: float):
+        """
+        Helper function for make_field. \n
+        Calculate the total volume for the field, accounting for excluded peaks.
+        """
+        if boundaries:      # If user has specified boundaries
+            ra_min, ra_max,  dec_min, dec_max, z_min, z_max   = boundaries[0], boundaries[1], boundaries[2]
+
+        else:       # If user has not specified boundaries, use relevant galaxies to infer boundaries
+            coords = self.coords[gal_sample]
+            ra_min, ra_max, dec_min, dec_max, z_min, z_max = np.min(coords[:, 0]), np.max(coords[:, 0]),  np.min(coords[:, 1]), np.max(coords[:, 1]),  np.min(coords[:, 2]), np.max(coords[:, 2])
+
+        # Find Volume
+        theta_dec = np.radians(np.abs(dec_max - dec_min))
+        theta_ra = np.radians(np.abs(ra_max - ra_min)) * np.cos(theta_dec / 2)
+        solid_angle = theta_ra * theta_dec
+
+        volume_cube = (solid_angle / (4 * np.pi)) * (cosmo.comoving_volume(z_max) - cosmo.comoving_volume(z_min))
+        return volume_cube.value - bad_volume
 
 
 
     # ====================================================================
-
-
-    def popPlot(self, sp_key, xlims, ylims, zlims):
-
-        ots = [0,1,2]
-        ot_cs = ['tab:blue', 'tab:orange', 'tab:green']
-        ot_label = ['COSMOS2020', 'Spectroscopy', 'HST Grism']
-        s_gals = 40
-
-        g_ids = self.subpops[sp_key]
-
-        # Sample data: replace with your actual data
-        RA = self.coords[:,0][g_ids]  # Right Ascension
-        Dec = self.coords[:,1][g_ids]  # Declination
-        redshift =self.coords[:,2][g_ids]  # Redshift
-
-        fig = plt.figure(figsize=(8,18))
-        ax = fig.add_subplot(111, projection='3d')
-
-
-        for idx in range(len(ots)):
-            plot_ids = np.where(self.obs_type[g_ids]==ots[idx])
-            if len(plot_ids[0])>0:
-                ax.scatter(RA[plot_ids], Dec[plot_ids], redshift[plot_ids], marker='.', s=s_gals,
-                            c=ot_cs[idx], label=f"{ot_label[idx]} : {len(plot_ids[0])}")
-
-                ax.scatter(RA[plot_ids], Dec[plot_ids],zlims[0], marker='.', s=s_gals/2,
-                            c=ot_cs[idx],alpha=0.35)
-                
-                ax.scatter(RA[plot_ids], ylims[0], redshift[plot_ids], marker='.', s=s_gals/2,
-                
-                            c=ot_cs[idx],alpha=0.35)
-        # Plot the projection (shadow) on the x-y plane at z=0
-
-        # Set labels
-        ax.set_xlabel('RA', fontsize=15)
-        ax.set_ylabel('Dec', fontsize=15)
-        ax.set_zlabel('Redshift', fontsize=15)
-        ax.set_xlim(xlims)
-        ax.set_ylim(ylims)
-        ax.set_zlim(zlims)
-        ax.legend(title="Source of Redshift", title_fontsize=12)
-        # ax.invert_xaxis()
-
-        # Adjust the viewing angle: set the elevation (elev) close to 0
-        ax.set_box_aspect(aspect=(1,1,2), zoom=1.2)
-        ax.view_init(elev=25, azim=30)  # Adjust azim for a better view
-
-        plt.show()
-
-
-    def popPlot2(self, sp_key, xlims, ylims, zlims, az, el):
-        ots = [0,1,2]
-        ot_cs = ['tab:blue', 'tab:orange', 'tab:green']
-        ot_label = ['COSMOS2020', 'Spectroscopy', 'HST Grism']
-        s_gals = 40
-
-        g_ids = self.subpops[sp_key]
-
-        # Sample data: replace with your actual data
-        RA = self.coords[:,0][g_ids]  # Right Ascension
-        Dec = self.coords[:,1][g_ids]  # Declination
-        redshift =self.coords[:,2][g_ids]  # Redshift
-
-        fig = plt.figure(figsize=(8,18))
-        ax = fig.add_subplot(111, projection='3d')
-
-        for idx in range(len(ots)):
-            plot_ids = np.where(self.obs_type[g_ids]==ots[idx])
-            if len(plot_ids[0])>0:
-                ax.scatter(RA[plot_ids], Dec[plot_ids], redshift[plot_ids], marker='.', s=s_gals,
-                            c=ot_cs[idx], label=f"{ot_label[idx]} : {len(plot_ids[0])}")
-
-        # Contour on x-y plane
-        xy = np.vstack([RA, Dec])
-        kde = gaussian_kde(xy)
-        xgrid = np.linspace(xlims[0], xlims[1], 500)
-        ygrid = np.linspace(ylims[0], ylims[1], 500)
-        X, Y = np.meshgrid(xgrid, ygrid)
-        Z = kde(np.vstack([X.ravel(), Y.ravel()])).reshape(X.shape)
-
-        ax.contour(X, Y, Z, levels=10, cmap='spring', offset=zlims[0], zdir='z')  # Ensure the offset aligns with the z-axis limit
-
-        # Contour on x-z plane
-        xz = np.vstack([RA, redshift])
-        kde = gaussian_kde(xz)
-        xgrid = np.linspace(xlims[0], xlims[1], 500)
-        zgrid = np.linspace(zlims[0], zlims[1], 500)
-        X, Z = np.meshgrid(xgrid, zgrid)
-        Y = kde(np.vstack([X.ravel(), Z.ravel()])).reshape(X.shape)
-
-        ax.contour(X, Y, Z, levels=10, cmap='autumn', offset=ylims[0], zdir='y')  # Ensure the offset aligns with the y-axis limit
-        ax.set_xlabel('\nRA', fontsize=15)
-        ax.set_ylabel('\nDec', fontsize=15)
-        ax.set_zlabel('\nRedshift', fontsize=15)
-        ax.set_xlim(xlims)
-        ax.set_ylim(ylims)
-        ax.set_zlim(zlims)
-        ax.set_xticks(np.linspace(xlims[0], xlims[1], num=5))
-
-        ax.legend(title="Source of Redshift", title_fontsize=12)
-
-        # Adjust the viewing angle
-        ax.set_box_aspect(aspect=(1,1,2), zoom=1.2)
-        ax.invert_xaxis()
-        ax.view_init(elev=el, azim=az)  # Experiment with different elevation and azimuth angles
-
-        plt.show()
-
-
-
-
-
-
+    # ====================================================================
     # ====================================================================
 
 
+    def modify_subpops(self, new_sp : str, base_sp : str, other_sps : Iterable[str], include : bool = True):
+            """
+            Creates a new subpopulation based on an existing one and a list of other subpopulations. This either combines the populations, or excludes the other 
+            subpopulations from the base subpopulation. \n
+            Caution! This uses a simple addition or subtraction of volumes. If the subpops are not exclusive in space, the resulting volume may not be reliable
+
+            Parameters:
+            ------
+            new_name : str
+                Name of the new subpopulation to add to self.subpops
+
+            base_name : str
+                Name of the subpopulation in self.subpops to serve as a basis for the new subpopulation
+
+            other_sps : Iterable[str] : 
+                Names of the subpopulations to include or exclude.
+
+            include : bool
+                Whether to include (True) or exclude (False) the other subpopulations from the base subpopulation
+            """
+            ## Validate inputs
+
+            if base_sp not in self.subpops:
+                raise ValueError(f"Base subpopulation '{base_sp}' not found.")
+            if not all(name in self.subpops for name in other_sps):
+                raise ValueError("One or more specified subpopulations are not found.")
+            if not other_sps:
+                raise ValueError("No subpopulations specified for inclusion or exclusion.")
+
+
+            # Start with the base subpopulation
+            new_galaxies = self.subpops[base_sp].copy()
+            new_volume = self.vols[base_sp]
+
+            # Inclusion:
+            if include:
+                for name in other_sps:
+                    new_galaxies = np.logical_or(new_galaxies, self.subpops[name])      # Check galaxies are in either of the populations
+                    new_volume += self.vols[name]
+
+            # Exclusion
+            else:
+                for name in other_sps:
+                    new_galaxies = np.logical_and(new_galaxies, ~self.subpops[name])    # Check galaxies are in base and not in the excluded pop
+                    new_volume -= self.vols[name]
+
+            # Caution user if Volume is negative
+            if new_volume <= 0:
+                warnings.warn("Negative volume found. The resulting volume may not be reliable.")
+            
+            # Add the new subpopulation
+            self.subpops[new_sp] = new_galaxies
+            self.vols[new_sp] = new_volume
+            
+
+
+    # ==========================================================================================
+    # ==========================================================================================
+    # ==========================================================================================
 
 
 
 
-
-    def update_Voxels(self, sig_cube) -> None:
+    def update_voxels(self, sig_cube) -> None:
         """
         Place each galaxy of the galaxy population into a voxel within the overdensity cube. The voxel coordinates are assigned to
         the 'voxel' attribute which speeds up future computations
@@ -873,7 +437,7 @@ class GalPop:
         """
         ## Update voxels if there are none
         if (len(self.voxels) == 0) or (np.all(np.isnan(self.voxels))):
-            self.update_Voxels(sig_cube)
+            self.update_voxels(sig_cube)
         
         if self.verbose: print("Updating overdensity values (self.ODs)")
 
@@ -893,7 +457,7 @@ class GalPop:
         """
         ## Update voxels if there are none
         if (len(self.voxels) == 0) or (np.all(np.isnan(self.voxels))):
-            self.update_Voxels(sig_cube)
+            self.update_voxels(sig_cube)
 
         ## Update overdensities if needed
         if (len(self.ODs) == 0) or (np.all(np.isnan(self.ODs))):
@@ -905,89 +469,12 @@ class GalPop:
         self.n_sigmas  = (self.ODs - sig_cube[11].data[self.voxels[:,2]]) / sig_cube[12].data[self.voxels[:,2]]    # (od - mean) / sigma
         
 
-    # ====================================================================
 
-    def del_objs(self, IDs):
-        """
-        Given some IDs in self.IDs, this deletes the corresponding element of all applicable attributes 
-            - NOTE: This can make some things no longer applicable (such as stored SMFs, volumes, etc)
-        """
-        idxs = np.where(np.in1d(self.IDs,IDs))     # Which indices to delete.
-
-        ## Loop through the attributes and combine where possible
-        for attr in self.__dict__:
-
-            if attr in ['vols', 'smfs', 'fits']:
-                continue
-
-            self_attr = getattr(self, attr)     # Attrs of this obj
-
-            # Delete in non-empty iterables (excluding dictionaries)
-            if self.isIt(self_attr) and (len(self_attr)!=0):
-
-                setattr(self, attr, np.delete(self_attr,idxs, axis=0) )
-
-            elif isinstance(self_attr, dict):   # attr is a dict
-
-                temp_dict = {}
-                for k in self_attr:
-                    temp_dict[k] = np.delete(self_attr[k], idxs)
-                setattr(self, attr, temp_dict)
 
 
     # ====================================================================
 
-    def combine(self, other):
-        """
-        Combine this instance with another GalPops instance to create a new object. 
-        Verbose for new object is set to True if both have Verbose=True
-            - NOTE: This method is currently is a bit messy with SMFs (and related attributes). It's recommended to 
-            remake the SMFs after combining
 
-        INPUTS:
-            - other (GalPop)    = Other GalPop object to combine with this one
-
-        OUTPUTS:
-            - (GalPoP) = returns a *new* object. This combination does not happen in place
-        """
-        combined_attrs = {}     # where to store the new attributes
-
-        ## Loop through the attributes and combine where possible
-        for attr in self.__dict__:
-
-            self_attr = getattr(self, attr)     # Attrs of this obj
-            other_attr = getattr(other, attr)   # other attrs
-
-            if self.isIt(self_attr): # attr is a list
-                combined_attrs[attr] = np.concatenate((self_attr, other_attr))   
-            elif isinstance(self_attr, dict):   # attr is a dict
-                combined_attrs[attr] = self._combine_dicts(self_attr, other_attr)
-        combined_attrs["verbose"] = bool(self_attr and other_attr)  # set verbose option
-
-        combined_instance = GalPop()
-        for attr, value in combined_attrs.items():
-            setattr(combined_instance, attr, value)
-        return combined_instance
-    
-    # ====================================================================
-
-    
-    def _combine_dicts(self, dict1, dict2):
-        """
-        Helper for self.combine. This combines two dictionary attributes for the two objects
-        """
-        combined_dict = {}
-        for key in set(dict1.keys()).union(dict2.keys()):
-            # Pull the lists from the dictionaries
-            ls1 = dict1.get(key, np.array([]))
-            ls2 = dict2.get(key, np.array([]))
-            # Turn into numpy arrays if needed
-            ls1 = np.array(ls1) if not isinstance(ls1, np.ndarray) else ls1
-            ls2 = np.array(ls2) if not isinstance(ls2, np.ndarray) else ls2
-            combined_dict[key] =  np.concatenate((ls1, ls2))
-        return combined_dict
-
-    # ====================================================================
 
     def create_LP_cat(self):
 
@@ -1008,7 +495,7 @@ class GalPop:
     # ====================================================================
 
 
-    def saveFile(self, path, ex=[]):
+    def save_file(self, path, ex=[]):
         """Save the object to a .npy file at the specified path, excluding specified attributes."""
         data = {key: value for key, value in self.__dict__.items() if key not in ex}
         np.save(path, data)
@@ -1019,29 +506,30 @@ class GalPop:
 
 
     @classmethod
-    def loadFile(cls, path):
-        """Load the object from a .npy file at the specified path."""
+    def load_file(cls, path):
+        """
+        Load the object from a .npy file at the specified path.
+        """
         data = np.load(path, allow_pickle=True).item()
         if not isinstance(data, dict):
             raise ValueError("Loaded data is not a dictionary. Ensure the file contains the correct data structure.")
-        
-        obj = cls()
+
+        # Extract mandatory parameters
+        IDs = data.pop("IDs", [])
+        coords = data.pop("coords", [])
+        ms = data.pop("ms", [])
+
+        # Create a new instance with the mandatory parameters
+        obj = cls(IDs, coords, ms)
+
+        # Update remaining attributes
         obj.__dict__.update(data)
+
         if obj.verbose:
             print(f"Loaded GalPop object from {path}")
         return obj
+
  
-    # ====================================================================
-
-
-    def isIt(self, it, ex=[dict, str]):
-        """
-        Given some object "it", check if it is an Iterable, excluding types in the list "ex"
-        """
-        result = isinstance(it, Iterable)   # First check if it's iterable
-        for t in ex:
-            result = result and not isinstance(it, t)       # Check if it is any of the excluded types
-        return result
 
 
 
